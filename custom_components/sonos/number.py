@@ -250,7 +250,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         async def _do_refresh() -> None:
             try:
                 # Small delay allows device to settle and de‑dupes SetVolume + event path
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.40)
                 await self._async_refresh_from_device()
             finally:
                 _GROUP_REFRESH_TASKS.pop(gid, None)
