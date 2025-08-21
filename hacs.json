@@ -1,0 +1,5 @@
+{
+  "name": "Sonos GV Test",
+  "render_readme": false,
+  "domains": ["sonos"]
+}
