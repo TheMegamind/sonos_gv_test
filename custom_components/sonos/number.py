@@ -310,11 +310,12 @@ async def _schedule_group_refresh_once(self, *, source: str = "event") -> None:
 
     @callback
     def _on_coord_state_updated(self, *_: object) -> None:
-        """Coordinator state changed — schedule one refresh for the group."""
+        # Coordinator state (external events)
         self.hass.loop.call_soon_threadsafe(
-            self.hass.async_create_task, self._schedule_group_refresh_once()
+            self.hass.async_create_task,
+            self._schedule_group_refresh_once(source="event"),
         )
-
+        
     @callback
     def _on_local_activity(self, *_: object) -> None:
         """Any speaker activity — rebind if coordinator/group changed, then refresh once."""
@@ -338,5 +339,6 @@ async def _schedule_group_refresh_once(self, *, source: str = "event") -> None:
                 self.async_on_remove(self._unsub_group_signal)
 
         self.hass.loop.call_soon_threadsafe(
-            self.hass.async_create_task, self._schedule_group_refresh_once()
+            self.hass.async_create_task,
+            self._schedule_group_refresh_once(source="event"),
         )
