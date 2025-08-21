@@ -202,9 +202,13 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         # Optimistic: update shared cache and broadcast so all entities redraw.
         if self._group_uid is not None:
             _GROUP_CACHE[self._group_uid] = level
-            async_dispatcher_send(self.hass, _group_signal(self._group_uid))
-        # Also push our own state on the loop thread
-        self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
+            # Must run on the event loop thread
+            self.hass.loop.call_soon_threadsafe(
+                async_dispatcher_send, self.hass, _group_signal(self._group_uid)
+            )
+
+        # Also push our own state on the event loop thread
+        self.hass.loop.call_soon_threadsafe(self.async_write_ha_state
 
     async def _async_fallback_poll(self) -> None:
         """Poll if subscriptions aren’t working."""
