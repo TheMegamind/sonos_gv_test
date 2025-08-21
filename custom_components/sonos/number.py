@@ -237,32 +237,25 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         # Always write our own state
         self.async_write_ha_state()
 
-async def _schedule_group_refresh_once(self, *, source: str = "event") -> None:
-    """Coalesce to a single in‑flight refresh per group, with optional trailing check."""
-    if self._group_uid is None:
-        return
+    async def _schedule_group_refresh_once(self) -> None:
+        """Coalesce to a single in‑flight refresh per group."""
+        if self._group_uid is None:
+            return
 
-    gid = self._group_uid
-    task = _GROUP_REFRESH_TASKS.get(gid)
-    if task and not task.done():
-        return  # already scheduled/running
+        gid = self._group_uid
+        task = _GROUP_REFRESH_TASKS.get(gid)
+        if task and not task.done():
+            return  # already scheduled/running
 
-    async def _do_refresh() -> None:
-        try:
-            # Debounce so the group mix converges before first poll
-            await asyncio.sleep(0.40)
-            await self._async_refresh_from_device()
-
-            # Optional trailing recheck ONLY for external events (member changes),
-            # not for HA-originated SetVolume. Catches rare late settles without
-            # causing two polls on slider writes.
-            if source == "event":
-                await asyncio.sleep(0.35)
+        async def _do_refresh() -> None:
+            try:
+                # Small delay allows device to settle and de‑dupes SetVolume + event path
+                await asyncio.sleep(0.40)
                 await self._async_refresh_from_device()
-        finally:
-            _GROUP_REFRESH_TASKS.pop(gid, None)
+            finally:
+                _GROUP_REFRESH_TASKS.pop(gid, None)
 
-    _GROUP_REFRESH_TASKS[gid] = self.hass.async_create_task(_do_refresh())
+        _GROUP_REFRESH_TASKS[gid] = self.hass.async_create_task(_do_refresh())
 
     # ---------- Push wiring for responsiveness ----------
 
@@ -310,12 +303,11 @@ async def _schedule_group_refresh_once(self, *, source: str = "event") -> None:
 
     @callback
     def _on_coord_state_updated(self, *_: object) -> None:
-        # Coordinator state (external events)
+        """Coordinator state changed — schedule one refresh for the group."""
         self.hass.loop.call_soon_threadsafe(
-            self.hass.async_create_task,
-            self._schedule_group_refresh_once(source="event"),
+            self.hass.async_create_task, self._schedule_group_refresh_once()
         )
-        
+
     @callback
     def _on_local_activity(self, *_: object) -> None:
         """Any speaker activity — rebind if coordinator/group changed, then refresh once."""
@@ -339,6 +331,5 @@ async def _schedule_group_refresh_once(self, *, source: str = "event") -> None:
                 self.async_on_remove(self._unsub_group_signal)
 
         self.hass.loop.call_soon_threadsafe(
-            self.hass.async_create_task,
-            self._schedule_group_refresh_once(source="event"),
+            self.hass.async_create_task, self._schedule_group_refresh_once()
         )
