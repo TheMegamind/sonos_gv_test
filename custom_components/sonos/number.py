@@ -208,7 +208,8 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             )
 
         # Also push our own state on the event loop thread
-        self.hass.loop.call_soon_threadsafe(self.async_write_ha_state
+        self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
+
 
     async def _async_fallback_poll(self) -> None:
         """Poll if subscriptions aren’t working."""
