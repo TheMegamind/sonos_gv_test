@@ -152,7 +152,7 @@ class SonosLevelEntity(SonosEntity, NumberEntity):
 
     @soco_error()
     def set_native_value(self, value: float) -> None:
-        """Set a new value for non-group numeric levels."""
+        """Set a new level on the device attribute (no group logic here)."""
         from_number = LEVEL_FROM_NUMBER.get(self.level_type, int)
         setattr(self.soco, self.level_type, from_number(value))
 
@@ -166,8 +166,9 @@ class SonosLevelEntity(SonosEntity, NumberEntity):
 class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     """Group volume control (0.0–1.0) for the Sonos group of this player.
 
-    READS:    average of member device volumes (RenderingControl.Volume), matching Hubitat.
-    WRITES:   GroupRenderingControl.GroupVolume (master group volume).
+    Semantics:
+      - If grouped: read/write GroupRenderingControl.*GroupVolume on the coordinator.
+      - If not grouped: read/write RenderingControl Master volume on this player.
     """
 
     _attr_translation_key = "group_volume"
@@ -175,9 +176,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     _attr_native_max_value = 1.0
     _attr_native_step = 0.01
     _attr_mode = NumberMode.SLIDER
-
-    # Retry window (seconds) after topology churn to re-poll once
-    _topology_retry_secs = 0.6
 
     def __init__(self, speaker: SonosSpeaker, config_entry: SonosConfigEntry) -> None:
         """Initialize the Sonos group volume number entity."""
@@ -192,8 +190,14 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     # ---------- Helpers ----------
 
     def _current_group_uid(self) -> str:
-        # Any member can read the group's UID through SoCo
         return self.soco.group.uid
+
+    def _is_grouped(self) -> bool:
+        """True if more than one UUID is in the current group."""
+        try:
+            return len(self.soco.group.members) > 1
+        except Exception:  # very defensive, networking/transient
+            return False
 
     def _cancel_task(self, gid: str | None) -> None:
         """Cancel and remove any in-flight refresh task for the group."""
@@ -204,8 +208,13 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         if task is not None:
             try:
                 task.cancel()
-            except Exception:  # pragma: no cover - defensive
+            except Exception:
                 pass
+
+    def _invalidate_cache(self, gid: str | None) -> None:
+        if gid is None:
+            return
+        _group_cache(self.hass).pop(gid, None)
 
     # ---------- Reading / writing ----------
 
@@ -217,22 +226,28 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     @property
     def native_value(self) -> float | None:
         """Return the group volume from the shared cache (0.0–1.0)."""
-        if self._group_uid is None:
+        gid = self._group_uid
+        if gid is None:
             return None
-        return _group_cache(self.hass).get(self._group_uid)
+        return _group_cache(self.hass).get(gid)
 
     @soco_error()
     def set_native_value(self, value: float) -> None:
-        """Set the group master volume (0.0–1.0) with optimistic update."""
+        """Set group volume (or player volume if solo) with optimistic update."""
         level = max(0.0, min(1.0, float(value)))
-        # Write to device (master group volume)
+        vol_int = int(round(level * 100))
+
+        # Hubitat-like semantics: coordinator if grouped, else local player volume
         try:
-            self.soco.group.volume = int(round(level * 100))
+            if self._is_grouped():
+                self.soco.group.volume = vol_int
+            else:
+                self.soco.volume = vol_int
         except (SoCoException, OSError) as err:
-            _LOGGER.debug("Failed to set group volume for %s: %s", self.entity_id, err)
+            _LOGGER.debug("Failed to write volume on %s: %s", self.speaker.zone_name, err)
             return
 
-        # Optimistic cache + broadcast
+        # Optimistic cache + broadcast (thread-safe hop)
         if self._group_uid is not None:
             cache = _group_cache(self.hass)
             cache[self._group_uid] = level
@@ -241,7 +256,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             )
             self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
 
-        # Confirm with a coalesced refresh pass
+        # Confirm with a fresh read next tick
         self.hass.loop.call_soon_threadsafe(
             self.hass.async_create_task, self._schedule_group_refresh_once()
         )
@@ -251,44 +266,40 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         await self._schedule_group_refresh_once()
 
     async def _async_refresh_from_device(self) -> None:
-        """Compute current group volume as average of member volumes and update cache."""
-
+        """Fetch current (group or player) volume from SoCo and update shared cache."""
         gid_actual = self.soco.group.uid
-        coord = (self.speaker.coordinator or self.speaker).soco
-        _LOGGER.debug(
-            "GV refresh(avg members): entity=%s gid_actual=%s coord_ip=%s me_ip=%s",
-            self.entity_id, gid_actual, coord.ip_address, self.soco.ip_address
-        )
 
-        def _get_member_volumes() -> list[int]:
-            vols: list[int] = []
+        def _get() -> int | None:
             try:
-                members = list(self.soco.group.members or [])
-            except Exception as err:  # pragma: no cover - defensive
-                _LOGGER.debug("Failed to get group members for %s: %s", self.entity_id, err)
-                members = [self.soco]  # best effort
-            for m in members:
-                try:
-                    v = int(m.volume)
-                    if 0 <= v <= 100:
-                        vols.append(v)
-                except (SoCoException, OSError, ValueError) as err:
-                    _LOGGER.debug("Failed to read member volume (%s) for %s: %s", getattr(m, "ip_address", "?"), self.entity_id, err)
-            return vols
+                if self._is_grouped():
+                    return self.soco.group.volume
+                # Solo: read RenderingControl Master volume
+                return self.soco.volume
+            except (SoCoException, OSError) as err:
+                _LOGGER.debug(
+                    "Failed to read volume for %s: %s", self.speaker.zone_name, err
+                )
+                return None
 
-        vols = await self.hass.async_add_executor_job(_get_member_volumes)
-        if not vols:
+        vol = await self.hass.async_add_executor_job(_get)
+        if vol is None:
             return
 
-        avg_int = round(sum(vols) / len(vols))
-        new = max(0.0, min(1.0, avg_int / 100.0))
+        new = max(0.0, min(1.0, vol / 100.0))
 
-        cache_gid = gid_actual
         cache = _group_cache(self.hass)
 
-        if cache.get(cache_gid) != new:
-            cache[cache_gid] = new
-            async_dispatcher_send(self.hass, _group_signal(cache_gid))
+        # If our notion of group changed since scheduling, don't touch the stale cache
+        if self._group_uid and self._group_uid != gid_actual:
+            _LOGGER.debug(
+                "GV refresh: stale self._group_uid=%s, actual=%s — writing only to actual",
+                self._group_uid,
+                gid_actual,
+            )
+
+        if cache.get(gid_actual) != new:
+            cache[gid_actual] = new
+            async_dispatcher_send(self.hass, _group_signal(gid_actual))
 
         self.async_write_ha_state()
 
@@ -323,7 +334,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         """Subscribe to signals for live updates with minimal polling."""
         await super().async_added_to_hass()
 
-        # Track current coordinator & group and listen for activity
         self._coord_uid = (self.speaker.coordinator or self.speaker).uid
         self._group_uid = self._current_group_uid()
 
@@ -373,6 +383,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self._cancel_task(self._group_uid)
         if self._group_uid is not None:
             _group_scheduled(self.hass).discard(self._group_uid)
+            self._invalidate_cache(self._group_uid)
 
     def _bind_coordinator_state(self, coord_uid: str) -> None:
         """(Re)bind a single STATE_UPDATED listener for the given coordinator."""
@@ -398,24 +409,23 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
     @callback
     def _on_local_activity(self, *_: object) -> None:
-        """Any speaker activity — rebind if coordinator/group changed, then refresh."""
+        """Any speaker activity — rebind if coordinator/group changed, then refresh once."""
         new_coord_uid = (self.speaker.coordinator or self.speaker).uid
         new_group_uid = self._current_group_uid()
 
-        # Rebind coordinator listener if needed
         if new_coord_uid != self._coord_uid:
             self._coord_uid = new_coord_uid
             self._bind_coordinator_state(new_coord_uid)
 
-        # If group changed, move our signal and cancel any old group work
         if new_group_uid != self._group_uid:
+            # Unhook old group, cancel its task, and invalidate its cache
             if self._unsub_group_signal is not None:
                 self._unsub_group_signal()
                 self._unsub_group_signal = None
-
             self._cancel_task(self._group_uid)
             if self._group_uid is not None:
                 _group_scheduled(self.hass).discard(self._group_uid)
+                self._invalidate_cache(self._group_uid)
 
             self._group_uid = new_group_uid
 
@@ -425,14 +435,5 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 )
                 self.async_on_remove(self._unsub_group_signal)
 
-            # Immediately refresh on the *new* group
-            self.hass.async_create_task(self._schedule_group_refresh_once())
-
-            # And schedule a short retry to catch propagation lag
-            async def _retry() -> None:
-                await self._schedule_group_refresh_once()
-
-            self.hass.loop.call_later(self._topology_retry_secs, lambda: self.hass.async_create_task(_retry()))
-        else:
-            # No group change, just refresh once
-            self.hass.async_create_task(self._schedule_group_refresh_once())
+        # Schedule a single refresh for the (possibly new) group (or solo)
+        self.hass.async_create_task(self._schedule_group_refresh_once())
