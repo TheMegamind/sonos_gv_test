@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable
 import logging
 from typing import cast
@@ -10,7 +9,7 @@ from typing import cast
 from soco.exceptions import SoCoException
 
 from homeassistant.components.number import NumberEntity, NumberMode
-from homeassistant.const import EntityCategory
+from homeassistant.const import EntityCategory, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
@@ -38,16 +37,30 @@ type SocoFeatures = list[tuple[str, tuple[int, int]]]
 
 _LOGGER = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Per‑group coordination to fix double polling & mismatched values
-# ──────────────────────────────────────────────────────────────────────────────
-_GROUP_CACHE: dict[str, float] = {}              # group_uid -> last value (0.0–1.0)
-_GROUP_REFRESH_TASKS: dict[str, asyncio.Task] = {}  # group_uid -> running task
-_GROUP_SIGNAL = "sonos-group-volume-updated"     # signal base; suffixed by group_uid
+# -----------------------------------------------------------------------------
+# Per-HASS storage (avoids cross-test leaks)
+# -----------------------------------------------------------------------------
+_CACHE_KEY = "sonos_number.group_cache"          # dict[group_uid, float]
+_SCHEDULED_KEY = "sonos_number.group_scheduled"  # set[group_uid]
+_TASKS_KEY = "sonos_number.group_tasks"          # dict[group_uid, asyncio.Task]
+_SIGNAL_BASE = "sonos-group-volume-updated"      # suffixed by group_uid
 
 
 def _group_signal(group_uid: str) -> str:
-    return f"{_GROUP_SIGNAL}-{group_uid}"
+    return f"{_SIGNAL_BASE}-{group_uid}"
+
+
+def _group_cache(hass: HomeAssistant) -> dict[str, float]:
+    return hass.data.setdefault(_CACHE_KEY, {})
+
+
+def _group_scheduled(hass: HomeAssistant) -> set[str]:
+    return hass.data.setdefault(_SCHEDULED_KEY, set())
+
+
+def _group_tasks(hass: HomeAssistant) -> dict[str, object]:
+    # value is an asyncio.Task, but we keep it as object to avoid importing asyncio
+    return hass.data.setdefault(_TASKS_KEY, {})
 
 
 def _balance_to_number(state: tuple[int, int]) -> float:
@@ -167,12 +180,26 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self._group_uid: str | None = None
         self._unsub_coord: Callable[[], None] | None = None
         self._unsub_group_signal: Callable[[], None] | None = None
+        self._unsub_stop: Callable[[], None] | None = None
 
     # ---------- Helpers ----------
 
     def _current_group_uid(self) -> str:
         # Any member can read the group's UID through SoCo
         return self.soco.group.uid
+
+    def _cancel_task(self, gid: str | None) -> None:
+        """Cancel and remove any in-flight refresh task for the group."""
+        if gid is None:
+            return
+        tasks = _group_tasks(self.hass)
+        task = tasks.pop(gid, None)
+        if task is not None:
+            try:
+                # Task may already be done
+                task.cancel()
+            except Exception:  # pragma: no cover - very defensive
+                pass
 
     # ---------- Reading / writing ----------
 
@@ -186,30 +213,22 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         """Return the group volume from the shared cache (0.0–1.0)."""
         if self._group_uid is None:
             return None
-        return _GROUP_CACHE.get(self._group_uid)
+        return _group_cache(self.hass).get(self._group_uid)
 
     @soco_error()
     def set_native_value(self, value: float) -> None:
-        """Set the group volume (0.0–1.0) with optimistic update.
-
-        We do NOT immediately poll; we rely on events + the
-        coalesced refresh task to update the shared cache once.
-        """
+        """Set the group volume (0.0–1.0) with optimistic update."""
         level = max(0.0, min(1.0, float(value)))
-        # Write to the device (coordinator's GroupRenderingControl)
+        # Write to device
         self.soco.group.volume = int(round(level * 100))
-
-        # Optimistic: update shared cache and broadcast so all entities redraw.
+        # Optimistic cache + broadcast (thread-safe hop)
         if self._group_uid is not None:
-            _GROUP_CACHE[self._group_uid] = level
-            # Must run on the event loop thread
+            cache = _group_cache(self.hass)
+            cache[self._group_uid] = level
             self.hass.loop.call_soon_threadsafe(
                 async_dispatcher_send, self.hass, _group_signal(self._group_uid)
             )
-
-        # Also push our own state on the event loop thread
-        self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
-
+            self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
 
     async def _async_fallback_poll(self) -> None:
         """Poll if subscriptions aren’t working."""
@@ -234,33 +253,36 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             return
 
         new = max(0.0, min(1.0, vol / 100.0))
-        if self._group_uid is not None and _GROUP_CACHE.get(self._group_uid) != new:
-            _GROUP_CACHE[self._group_uid] = new
-            # Notify ALL entities bound to this group to write state
-            async_dispatcher_send(self.hass, _group_signal(self._group_uid))
+        if self._group_uid is not None:
+            cache = _group_cache(self.hass)
+            if cache.get(self._group_uid) != new:
+                cache[self._group_uid] = new
+                async_dispatcher_send(self.hass, _group_signal(self._group_uid))
 
-        # Always write our own state
         self.async_write_ha_state()
 
     async def _schedule_group_refresh_once(self) -> None:
-        """Coalesce to a single in‑flight refresh per group."""
+        """Coalesce to a single refresh per group on the next loop tick.
+
+        Uses loop.call_soon so it fires under frozen time as well.
+        """
         if self._group_uid is None:
             return
 
         gid = self._group_uid
-        task = _GROUP_REFRESH_TASKS.get(gid)
-        if task and not task.done():
-            return  # already scheduled/running
+        scheduled = _group_scheduled(self.hass)
+        if gid in scheduled:
+            return
+        scheduled.add(gid)
 
-        async def _do_refresh() -> None:
-            try:
-                # Small delay allows device to settle and de‑dupes SetVolume + event path
-                await asyncio.sleep(0.40)
-                await self._async_refresh_from_device()
-            finally:
-                _GROUP_REFRESH_TASKS.pop(gid, None)
+        def _runner() -> None:
+            # Clear scheduled flag first, then create task (and track it)
+            scheduled.discard(gid)
+            task = self.hass.async_create_task(self._async_refresh_from_device())
+            _group_tasks(self.hass)[gid] = task
 
-        _GROUP_REFRESH_TASKS[gid] = self.hass.async_create_task(_do_refresh())
+        # Next loop tick; not time-based, so it fires with freezegun
+        self.hass.loop.call_soon(_runner)
 
     # ---------- Push wiring for responsiveness ----------
 
@@ -272,24 +294,53 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self._coord_uid = (self.speaker.coordinator or self.speaker).uid
         self._group_uid = self._current_group_uid()
 
-        # Listen for global activity (topology/volume changes anywhere)
+        # Global activity (topology/volume changes anywhere)
         self.async_on_remove(
             async_dispatcher_connect(
                 self.hass, SONOS_SPEAKER_ACTIVITY, self._on_local_activity
             )
         )
-        # Listen to coordinator state updates
+        # Coordinator state updates
         self._bind_coordinator_state(self._coord_uid)
 
-        # Listen for shared cache updates for our group (so every member redraws)
+        # Shared cache updates for our group
         if self._group_uid:
             self._unsub_group_signal = async_dispatcher_connect(
                 self.hass, _group_signal(self._group_uid), self._push_state
             )
             self.async_on_remove(self._unsub_group_signal)
 
-        # Initial read populates the shared cache
+        # Cancel on HA stop (safety)
+        @callback
+        def _on_stop(_event) -> None:
+            self._cancel_task(self._group_uid)
+
+        self._unsub_stop = self.hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STOP, _on_stop
+        )
+        self.async_on_remove(self._unsub_stop)
+
+        # Initial read populates cache
         await self._async_refresh_from_device()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Clean up listeners and pending work to avoid teardown hangs."""
+        await super().async_will_remove_from_hass()
+
+        if self._unsub_group_signal is not None:
+            self._unsub_group_signal()
+            self._unsub_group_signal = None
+        if self._unsub_coord is not None:
+            self._unsub_coord()
+            self._unsub_coord = None
+        if self._unsub_stop is not None:
+            self._unsub_stop()
+            self._unsub_stop = None
+
+        # Cancel in-flight refresh task and clear scheduled flag for our group
+        self._cancel_task(self._group_uid)
+        if self._group_uid is not None:
+            _group_scheduled(self.hass).discard(self._group_uid)
 
     def _bind_coordinator_state(self, coord_uid: str) -> None:
         """(Re)bind a single STATE_UPDATED listener for the given coordinator."""
@@ -297,7 +348,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             self._unsub_coord()
             self._unsub_coord = None
         self._unsub_coord = async_dispatcher_connect(
-            self.hass, f"{SONOS_STATE_UPDATED}-{coord_uid}", self._on_coord_state_updated
+            self.hass,
+            f"{SONOS_STATE_UPDATED}-{coord_uid}",
+            self._on_coord_state_updated,
         )
         self.async_on_remove(self._unsub_coord)
 
@@ -309,9 +362,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     @callback
     def _on_coord_state_updated(self, *_: object) -> None:
         """Coordinator state changed — schedule one refresh for the group."""
-        self.hass.loop.call_soon_threadsafe(
-            self.hass.async_create_task, self._schedule_group_refresh_once()
-        )
+        self.hass.async_create_task(self._schedule_group_refresh_once())
 
     @callback
     def _on_local_activity(self, *_: object) -> None:
@@ -323,18 +374,21 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
         new_group_uid = self._current_group_uid()
         if new_group_uid != self._group_uid:
-            # Unsubscribe from old group signal
+            # Unsubscribe from old group signal and cancel its task
             if self._unsub_group_signal is not None:
                 self._unsub_group_signal()
                 self._unsub_group_signal = None
+            self._cancel_task(self._group_uid)
+            if self._group_uid is not None:
+                _group_scheduled(self.hass).discard(self._group_uid)
+
             self._group_uid = new_group_uid
-            # Subscribe to the new group's signal
+
             if self._group_uid:
                 self._unsub_group_signal = async_dispatcher_connect(
                     self.hass, _group_signal(self._group_uid), self._push_state
                 )
                 self.async_on_remove(self._unsub_group_signal)
 
-        self.hass.loop.call_soon_threadsafe(
-            self.hass.async_create_task, self._schedule_group_refresh_once()
-        )
+        # Schedule a single refresh for the (possibly new) group
+        self.hass.async_create_task(self._schedule_group_refresh_once())
