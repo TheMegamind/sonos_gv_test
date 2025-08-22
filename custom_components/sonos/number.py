@@ -236,41 +236,49 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
     async def _async_refresh_from_device(self) -> None:
         """Fetch current group volume from SoCo and update shared cache."""
-
-        # 🔍 Debug: log who/what we’re about to poll
-        gid = self.soco.group.uid
+    
+        # (Optional but very helpful while iterating)
+        gid_actual = self.soco.group.uid
         coord = (self.speaker.coordinator or self.speaker).soco
         _LOGGER.debug(
-            "GV refresh: entity=%s gid=%s coord_ip=%s me_ip=%s",
-            self.entity_id,
-            gid,
-            coord.ip_address,
-            self.soco.ip_address,
+            "GV refresh: entity=%s gid_actual=%s coord_ip=%s me_ip=%s",
+            self.entity_id, gid_actual, coord.ip_address, self.soco.ip_address
         )
-
+    
         def _get() -> int | None:
             try:
                 return self.soco.group.volume
             except (SoCoException, OSError) as err:
                 _LOGGER.debug(
                     "Failed to read group volume for %s: %s",
-                    self.speaker.zone_name,
-                    err,
+                    self.speaker.zone_name, err,
                 )
                 return None
-
+    
         vol = await self.hass.async_add_executor_job(_get)
         if vol is None:
             return
-
+    
         new = max(0.0, min(1.0, vol / 100.0))
-        if self._group_uid is not None:
-            cache = _group_cache(self.hass)
-            if cache.get(self._group_uid) != new:
-                cache[self._group_uid] = new
-                async_dispatcher_send(self.hass, _group_signal(self._group_uid))
-
+    
+        # Only ever write to the *current* group’s cache to avoid cross‑contamination.
+        cache_gid = gid_actual
+        cache = _group_cache(self.hass)
+    
+        # If we got scheduled before a topology change, avoid touching stale group cache
+        if self._group_uid and self._group_uid != gid_actual:
+            _LOGGER.debug(
+                "GV refresh: stale self._group_uid=%s, actual=%s — writing only to actual",
+                self._group_uid, gid_actual
+            )
+    
+        if cache.get(cache_gid) != new:
+            cache[cache_gid] = new
+            async_dispatcher_send(self.hass, _group_signal(cache_gid))
+    
+        # Always write our own state
         self.async_write_ha_state()
+
 
     async def _schedule_group_refresh_once(self) -> None:
         """Coalesce to a single refresh per group on the next loop tick.
@@ -332,7 +340,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self.async_on_remove(self._unsub_stop)
 
         # Initial read populates cache
-        await self._async_refresh_from_device()
+        await self._schedule_group_refresh_once()
 
     async def async_will_remove_from_hass(self) -> None:
         """Clean up listeners and pending work to avoid teardown hangs."""
