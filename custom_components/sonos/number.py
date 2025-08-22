@@ -237,6 +237,17 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     async def _async_refresh_from_device(self) -> None:
         """Fetch current group volume from SoCo and update shared cache."""
 
+        # 🔍 Debug: log who/what we’re about to poll
+        gid = self.soco.group.uid
+        coord = (self.speaker.coordinator or self.speaker).soco
+        _LOGGER.debug(
+            "GV refresh: entity=%s gid=%s coord_ip=%s me_ip=%s",
+            self.entity_id,
+            gid,
+            coord.ip_address,
+            self.soco.ip_address,
+        )
+
         def _get() -> int | None:
             try:
                 return self.soco.group.volume
