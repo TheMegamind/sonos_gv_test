@@ -152,9 +152,21 @@ class SonosLevelEntity(SonosEntity, NumberEntity):
 
     @soco_error()
     def set_native_value(self, value: float) -> None:
-        """Set a new value."""
-        from_number = LEVEL_FROM_NUMBER.get(self.level_type, int)
-        setattr(self.soco, self.level_type, from_number(value))
+        level = max(0.0, min(1.0, float(value)))
+        self.soco.group.volume = int(round(level * 100))
+    
+        if self._group_uid is not None:
+            cache = _group_cache(self.hass)
+            cache[self._group_uid] = level
+            self.hass.loop.call_soon_threadsafe(
+                async_dispatcher_send, self.hass, _group_signal(self._group_uid)
+            )
+            self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
+    
+        # Coalesced confirmation refresh (runs next loop tick, won’t spam)
+        self.hass.loop.call_soon_threadsafe(
+            self.hass.async_create_task, self._schedule_group_refresh_once()
+        )
 
     @property
     def native_value(self) -> float:
@@ -295,10 +307,18 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         scheduled.add(gid)
 
         def _runner() -> None:
-            # Clear scheduled flag first, then create task (and track it)
             scheduled.discard(gid)
             task = self.hass.async_create_task(self._async_refresh_from_device())
-            _group_tasks(self.hass)[gid] = task
+            tasks = _group_tasks(self.hass)
+            tasks[gid] = task
+        
+            def _cleanup(_):
+                # Remove only if it still points to this same task
+                if tasks.get(gid) is task:
+                    tasks.pop(gid, None)
+
+        task.add_done_callback(_cleanup)
+
 
         # Next loop tick; not time-based, so it fires with freezegun
         self.hass.loop.call_soon(_runner)
