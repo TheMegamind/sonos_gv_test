@@ -165,7 +165,6 @@ class SonosLevelEntity(SonosEntity, NumberEntity):
         to_number = LEVEL_TO_NUMBER.get(self.level_type, int)
         return cast(float, to_number(getattr(self.speaker, self.level_type)))
 
-
 class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     """Native Sonos group volume for the player's current group (0–100).
 
@@ -201,10 +200,13 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         return self.soco.group.uid
 
     def _is_grouped(self) -> bool:
-        try:
-            return len(self.soco.group.members) > 1
-        except Exception:
+        """Return True if the player is in a group with 2+ members."""
+        group = getattr(self.soco, "group", None)
+        if group is None:
             return False
+        members = getattr(group, "members", None)
+        return bool(members and len(members) > 1)
+
 
     def _coordinator_soco(self):
         # member or coordinator: this returns the coordinator SoCo
@@ -214,10 +216,12 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
     @property
     def available(self) -> bool:
+        """Return whether the speaker is currently available."""
         return bool(self.speaker.available)
 
     @property
     def native_value(self) -> float | None:
+        """Return the current group volume (0–100) or None if unknown."""
         return None if self._value is None else float(self._value)
 
     # ------------------ read / write ---------------------
@@ -292,6 +296,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     # ------------------ wiring & lifecycle ----------------
 
     async def async_added_to_hass(self) -> None:
+        """Finish setup: bind signals and perform an initial refresh."""
         await super().async_added_to_hass()
 
         self._coord_uid = (self.speaker.coordinator or self.speaker).uid
@@ -328,6 +333,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         await self._async_refresh_from_device()
 
     async def async_will_remove_from_hass(self) -> None:
+        """Clean up signal subscriptions on removal."""
         await super().async_will_remove_from_hass()
 
         if self._unsub_gv_signal is not None:
