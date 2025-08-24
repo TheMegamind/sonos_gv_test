@@ -9,7 +9,7 @@ from typing import cast
 from soco.exceptions import SoCoException
 
 from homeassistant.components.number import NumberEntity, NumberMode
-from homeassistant.const import EntityCategory, EVENT_HOMEASSISTANT_STOP
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
@@ -268,7 +268,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         if vol is None:
             return
 
-        changed = (self._value != vol)
+        changed = self._value != vol
         self._value = vol
         self.async_write_ha_state()
 
@@ -282,13 +282,12 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                     gid_actual,
                     vol,
                 )
-        else:
-            if changed:
-                _LOGGER.debug(
-                    "GV refresh: zone=%s grouped=False vol=%s",
-                    self.speaker.zone_name,
-                    vol,
-                )
+        elif changed:
+            _LOGGER.debug(
+                "GV refresh: zone=%s grouped=False vol=%s",
+                self.speaker.zone_name,
+                vol,
+            )
 
     # ------------------ wiring & lifecycle ----------------
 
