@@ -438,7 +438,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 self.async_on_remove(self._unsub_gv_signal)
 
             # NEW: small debounce before reading after topology change
-            async_call_later(self.hass, 0.3, lambda _now: self.hass.async_create_task(self._async_refresh_from_device()))
+            async_call_later(self.hass, 0.6, lambda _now: self.hass.async_create_task(self._async_refresh_from_device()))
             return
 
         # No topology change — one fresh read
