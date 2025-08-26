@@ -105,7 +105,7 @@ async def async_setup_entry(
             available_soco_attributes, speaker
         )
 
-        # Standard SoCo‑backed level controls
+        # Standard SoCo-backed level controls
         for level_type, valid_range in available_features:
             _LOGGER.debug(
                 "Creating %s number control on %s", level_type, speaker.zone_name
@@ -165,6 +165,7 @@ class SonosLevelEntity(SonosEntity, NumberEntity):
         to_number = LEVEL_TO_NUMBER.get(self.level_type, int)
         return cast(float, to_number(getattr(self.speaker, self.level_type)))
 
+
 class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     """Native Sonos group volume for the player's current group (0–100).
 
@@ -207,10 +208,17 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         members = getattr(group, "members", None)
         return bool(members and len(members) > 1)
 
-
     def _coordinator_soco(self):
         # member or coordinator: this returns the coordinator SoCo
         return (self.speaker.coordinator or self.speaker).soco
+
+    # ---------------------- rounding ----------------------
+    @staticmethod
+    def _round_half_up(value: float) -> int:
+        """Round like Sonos UI: halves round up (e.g. 56.5 -> 57)."""
+        from decimal import Decimal, ROUND_HALF_UP
+
+        return int(Decimal(str(value)).quantize(0, rounding=ROUND_HALF_UP))
 
     # ------------------ HA entity bits -------------------
 
@@ -229,7 +237,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     @soco_error()
     def set_native_value(self, value: float) -> None:
         """Set group volume (0–100). If not grouped, set player volume."""
-        level = int(round(max(0.0, min(100.0, float(value)))))
+        # Clamp and half-up round to match Sonos UI
+        fval = max(0.0, min(100.0, float(value)))
+        level = self._round_half_up(fval)
 
         if self._is_grouped():
             # Set at the coordinator
@@ -258,7 +268,19 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         def _get() -> int | None:
             try:
                 if self._is_grouped():
-                    # Any member can query; SoCo will address the coordinator
+                    # Recompute from current member volumes to match Sonos UI (avg, halves round up)
+                    members = getattr(self.soco.group, "members", None) or []
+                    vols: list[int] = []
+                    for m in members:
+                        try:
+                            v = int(getattr(m, "volume"))
+                        except (AttributeError, SoCoException, ValueError, TypeError):
+                            continue
+                        vols.append(v)
+                    if vols:
+                        avg = sum(vols) / len(vols)
+                        return SonosGroupVolumeEntity._round_half_up(avg)
+                    # Fallback to the coordinator's group property if members unavailable
                     return int(self.soco.group.volume)
                 # Ungrouped: mirror player volume
                 return int(self.soco.volume)
