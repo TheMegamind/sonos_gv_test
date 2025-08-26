@@ -16,6 +16,7 @@ from homeassistant.helpers.dispatcher import (
     async_dispatcher_send,
 )
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.event import async_call_later  # NEW: small debounce
 
 from .const import SONOS_CREATE_LEVELS, SONOS_SPEAKER_ACTIVITY, SONOS_STATE_UPDATED
 from .entity import SonosEntity
@@ -188,6 +189,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self._group_uid: str | None = None
 
         self._unsub_coord: Callable[[], None] | None = None
+        self._unsub_member: Callable[[], None] | None = None  # NEW: listen to self
         self._unsub_activity: Callable[[], None] | None = None
         self._unsub_stop: Callable[[], None] | None = None
         self._unsub_gv_signal: Callable[[], None] | None = None
@@ -197,8 +199,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
     # ---------------------- helpers ----------------------
 
-    def _current_group_uid(self) -> str:
-        return self.soco.group.uid
+    def _current_group_uid(self) -> str | None:
+        group = getattr(self.soco, "group", None)
+        return getattr(group, "uid", None)
 
     def _is_grouped(self) -> bool:
         """Return True if the player is in a group with 2+ members."""
@@ -208,13 +211,12 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         members = getattr(group, "members", None)
         return bool(members and len(members) > 1)
 
+    def _is_coordinator(self) -> bool:
+        return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
+
     def _coordinator_soco(self):
         # member or coordinator: this returns the coordinator SoCo
         return (self.speaker.coordinator or self.speaker).soco
-
-    def _is_coordinator(self) -> bool:
-        """Return True if this entity controls the group coordinator."""
-        return self._coordinator_soco().uid == self.soco.uid
 
     # ------------------ HA entity bits -------------------
 
@@ -257,13 +259,14 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
     async def _async_refresh_from_device(self) -> None:
         """Read the *native* volume (group or player) and propagate to peers."""
-        gid_actual = self.soco.group.uid
+        gid_actual = self._current_group_uid()
 
         def _get() -> int | None:
             try:
                 if self._is_grouped():
-                    # Any member can query; SoCo will address the coordinator
-                    return int(self.soco.group.volume)
+                    # Always read from the coordinator to avoid member lag
+                    coord = self._coordinator_soco()
+                    return int(coord.group.volume)
                 # Ungrouped: mirror player volume
                 return int(self.soco.volume)
             except (SoCoException, OSError) as err:
@@ -314,14 +317,18 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self._coord_uid = (self.speaker.coordinator or self.speaker).uid
         self._group_uid = self._current_group_uid()
 
-        # Any activity from any speaker → check if topology changed, refresh once
+        # Any activity from any speaker → check if topology changed, refresh
         self._unsub_activity = async_dispatcher_connect(
             self.hass, SONOS_SPEAKER_ACTIVITY, self._on_any_activity
         )
         self.async_on_remove(self._unsub_activity)
 
-        # Coordinator state updates → refresh once
+        # Coordinator state updates → refresh
         self._bind_coordinator_state(self._coord_uid)
+
+        # NEW: Also listen to *this member's* state updates so member-initiated
+        # volume changes trigger a refresh as well.
+        self._bind_member_state(self.speaker.uid)
 
         # Subscribe to fan-out for our current group
         if self._group_uid:
@@ -333,7 +340,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         # Cancel nothing on HA stop (defensive placeholder)
         @callback
         def _on_stop(_event) -> None:
-            # nothing pending; left for symmetry / future use
             return
 
         self._unsub_stop = self.hass.bus.async_listen_once(
@@ -354,6 +360,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         if self._unsub_coord is not None:
             self._unsub_coord()
             self._unsub_coord = None
+        if self._unsub_member is not None:
+            self._unsub_member()
+            self._unsub_member = None
         if self._unsub_activity is not None:
             self._unsub_activity()
             self._unsub_activity = None
@@ -374,9 +383,26 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         )
         self.async_on_remove(self._unsub_coord)
 
+    def _bind_member_state(self, member_uid: str) -> None:
+        """NEW: listen to this entity's own state updates."""
+        if self._unsub_member is not None:
+            self._unsub_member()
+            self._unsub_member = None
+        self._unsub_member = async_dispatcher_connect(
+            self.hass,
+            f"{SONOS_STATE_UPDATED}-{member_uid}",
+            self._on_member_state_updated,
+        )
+        self.async_on_remove(self._unsub_member)
+
     @callback
     def _on_coord_state_updated(self, *_: object) -> None:
         # Coordinator state changed — fetch once
+        self.hass.async_create_task(self._async_refresh_from_device())
+
+    @callback
+    def _on_member_state_updated(self, *_: object) -> None:
+        # This member's state changed — fetch once
         self.hass.async_create_task(self._async_refresh_from_device())
 
     @callback
@@ -411,5 +437,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 )
                 self.async_on_remove(self._unsub_gv_signal)
 
-        # One fresh read
+            # NEW: small debounce before reading after topology change
+            async_call_later(self.hass, 0.3, lambda _now: self.hass.async_create_task(self._async_refresh_from_device()))
+            return
+
+        # No topology change — one fresh read
         self.hass.async_create_task(self._async_refresh_from_device())
