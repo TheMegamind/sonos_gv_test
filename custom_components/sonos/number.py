@@ -16,6 +16,7 @@ from homeassistant.helpers.dispatcher import (
     async_dispatcher_send,
 )
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.event import async_call_later  # <-- added
 
 from .const import SONOS_CREATE_LEVELS, SONOS_SPEAKER_ACTIVITY, SONOS_STATE_UPDATED
 from .entity import SonosEntity
@@ -55,30 +56,13 @@ def _gv_req_signal(gid: str) -> str:
 
 
 def _balance_to_number(state: tuple[int, int]) -> float:
-    """Represent a balance measure returned by SoCo as a number.
-
-    SoCo returns a pair of volumes, one for the left side and one
-    for the right side. When the two are equal, sound is centered;
-    HA will show that as 0. When the left side is louder, HA will
-    show a negative value, and a positive value means the right
-    side is louder. Maximum absolute value is 100, which means only
-    one side produces sound at all.
-    """
+    """Represent a balance measure returned by SoCo as a number."""
     left, right = state
     return (right - left) * 100 // max(right, left)
 
 
 def _balance_from_number(value: float) -> tuple[int, int]:
-    """Convert a balance value from -100 to 100 into SoCo format.
-
-    0 becomes (100, 100), fully enabling both sides. Note that
-    the master volume control is separate, so this does not
-    turn up the speakers to maximum volume. Negative values
-    reduce the volume of the right side, and positive values
-    reduce the volume of the left side. -100 becomes (100, 0),
-    fully muting the right side, and +100 becomes (0, 100),
-    muting the left side.
-    """
+    """Convert a balance value from -100 to 100 into SoCo format."""
     left = min(100, 100 - int(value))
     right = min(100, int(value) + 100)
     return left, right
@@ -198,30 +182,42 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self._unsub_stop: Callable[[], None] | None = None
         self._unsub_gv_signal: Callable[[], None] | None = None
         self._unsub_gv_req: Callable[[], None] | None = None
+        self._delay_unsub: Callable[[], None] | None = None  # <-- added
 
         # Internal cache of our last value (UI render)
         self._value: int | None = None
 
     # ---------------------- helpers ----------------------
 
+    def _coordinator_soco(self):
+        # member or coordinator: always return the coordinator SoCo
+        return (self.speaker.coordinator or self.speaker).soco
+
     def _current_group_uid(self) -> str | None:
-        group = getattr(self.soco, "group", None)
+        """Authoritative group uid (from coordinator)."""
+        group = getattr(self._coordinator_soco(), "group", None)
         return getattr(group, "uid", None)
 
     def _is_grouped(self) -> bool:
-        """Return True if the player is in a group with 2+ members."""
-        group = getattr(self.soco, "group", None)
-        if group is None:
-            return False
+        """True if coordinator view has 2+ members (avoids stale member view)."""
+        group = getattr(self._coordinator_soco(), "group", None)
         members = getattr(group, "members", None)
         return bool(members and len(members) > 1)
 
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
-    def _coordinator_soco(self):
-        # member or coordinator: this returns the coordinator SoCo
-        return (self.speaker.coordinator or self.speaker).soco
+    def _schedule_delayed_refresh(self, seconds: float = 0.4) -> None:
+        """Coalesce a short delayed refresh to catch Sonos settling after joins/leaves."""
+        if self._delay_unsub is not None:
+            self._delay_unsub()
+            self._delay_unsub = None
+
+        def _cb(_now) -> None:
+            self._delay_unsub = None
+            self.hass.async_create_task(self._async_refresh_from_device())
+
+        self._delay_unsub = async_call_later(self.hass, seconds, _cb)
 
     # ------------------ HA entity bits -------------------
 
@@ -246,10 +242,11 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             # Always set on the coordinator
             coord = self._coordinator_soco()
             coord.group.volume = level
-            # Ask the coordinator entity (which might be this entity) to refresh & fan
             gid = self._current_group_uid()
             if gid:
+                # Request immediate and delayed coordinator refresh
                 async_dispatcher_send(self.hass, _gv_req_signal(gid), None)
+                self._schedule_delayed_refresh()
         else:
             # Not grouped → act as player volume mirror
             self.soco.volume = level
@@ -263,8 +260,8 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         """Refresh group volume.
 
         - If grouped and coordinator: read coord.group.volume, write, and fan-out.
-        - If grouped and not coordinator: do nothing (await coordinator fan-out).
-        - If ungrouped: mirror own player volume locally (no fan-out).
+        - If grouped and not coordinator: await coordinator fan-out.
+        - If ungrouped: mirror own player volume locally.
         """
         gid_actual = self._current_group_uid()
 
@@ -367,8 +364,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         )
         self.async_on_remove(self._unsub_stop)
 
-        # Initial read
+        # Initial read + small delayed follow-up to catch startup settling
         await self._async_refresh_from_device()
+        self._schedule_delayed_refresh()
 
     async def async_will_remove_from_hass(self) -> None:
         """Clean up signal subscriptions on removal."""
@@ -392,6 +390,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         if self._unsub_stop is not None:
             self._unsub_stop()
             self._unsub_stop = None
+        if self._delay_unsub is not None:
+            self._delay_unsub()
+            self._delay_unsub = None
 
     # ------------------ signal handlers ------------------
 
@@ -436,11 +437,13 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         """Coordinator-only: a member asked for a group-volume refresh."""
         if not (self._is_grouped() and self._is_coordinator()):
             return
+        # Immediate and delayed to catch coordinator-side settling
         self.hass.async_create_task(self._async_refresh_from_device())
+        self._schedule_delayed_refresh()
 
     @callback
     def _on_coord_state_updated(self, *_: object) -> None:
-        """Coordinator state changed — request refresh."""
+        """Coordinator state changed — request refresh from coordinator entity."""
         gid = self._current_group_uid()
         if gid:
             async_dispatcher_send(self.hass, _gv_req_signal(gid), None)
@@ -452,17 +455,14 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             gid = self._current_group_uid()
             if gid:
                 async_dispatcher_send(self.hass, _gv_req_signal(gid), None)
+                self._schedule_delayed_refresh()
         else:
             # Ungrouped: mirror own player volume quickly
             self.hass.async_create_task(self._async_refresh_from_device())
 
     @callback
     def _on_group_volume_fanned(self, payload: tuple[str, int]) -> None:
-        """Receive the coordinator's fresh group volume and update instantly.
-
-        Payload: (gid, level). Ignore if our current gid does not match,
-        which prevents stale updates during rapid topology changes.
-        """
+        """Receive the coordinator's fresh group volume and update instantly."""
         if not self._is_grouped():
             return
         gid, level = payload
@@ -474,20 +474,13 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
     @callback
     def _on_any_activity(self, *_: object) -> None:
-        """Any speaker activity — rebind if coordinator/group changed, then refresh.
-
-        - Always rebind coordinator/member and group fan-out subscription.
-        - After rebinding:
-          * If grouped & coordinator → refresh immediately (authoritative).
-          * If grouped & not coordinator → request coordinator refresh.
-          * If ungrouped → mirror own volume.
-        """
+        """Any speaker activity — rebind if coordinator/group changed, then refresh."""
         new_coord_uid = (self.speaker.coordinator or self.speaker).uid
         if new_coord_uid != self._coord_uid:
             self._coord_uid = new_coord_uid
             self._bind_coordinator_state(new_coord_uid)
 
-        # (Re)bind per-member state hook (uid may change on role flips in some setups)
+        # (Re)bind per-member state hook
         self._bind_member_state(self.speaker.uid)
 
         new_group_uid = self._current_group_uid()
@@ -511,12 +504,14 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         # Post-rebind actions
         if self._is_grouped():
             if self._is_coordinator():
-                # Authoritative read + fan-out
+                # Authoritative read + fan-out (now and shortly after)
                 self.hass.async_create_task(self._async_refresh_from_device())
+                self._schedule_delayed_refresh()
             else:
                 gid = self._current_group_uid()
                 if gid:
                     async_dispatcher_send(self.hass, _gv_req_signal(gid), None)
+                    self._schedule_delayed_refresh()
         else:
             # Ungrouped: mirror quickly
             self.hass.async_create_task(self._async_refresh_from_device())
