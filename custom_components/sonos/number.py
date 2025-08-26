@@ -281,8 +281,14 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self.async_write_ha_state()
 
         # Fan-out the fresh *group* value so peers update immediately.
-        # Make the coordinator authoritative to avoid stale overwrites.
-        if self._is_grouped() and gid_actual and self._is_coordinator():
+        # Make the coordinator authoritative and ensure we're still bound
+        # to this exact group before broadcasting.
+        if (
+            self._is_grouped()
+            and gid_actual
+            and self._is_coordinator()
+            and self._group_uid == gid_actual
+        ):
             async_dispatcher_send(self.hass, _gv_signal(gid_actual), vol)
             if changed:
                 _LOGGER.debug(
@@ -376,6 +382,8 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     @callback
     def _on_group_volume_fanned(self, level: int) -> None:
         """Receive the coordinator's fresh group volume and update instantly."""
+        if not self._is_grouped():
+            return
         if self._value != level:
             self._value = level
             self.async_write_ha_state()
