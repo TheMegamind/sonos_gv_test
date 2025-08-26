@@ -212,13 +212,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         # member or coordinator: this returns the coordinator SoCo
         return (self.speaker.coordinator or self.speaker).soco
 
-    # ---------------------- rounding ----------------------
-    @staticmethod
-    def _round_half_up(value: float) -> int:
-        """Round like Sonos UI: halves round up (e.g. 56.5 -> 57)."""
-        from decimal import Decimal, ROUND_HALF_UP
-
-        return int(Decimal(str(value)).quantize(0, rounding=ROUND_HALF_UP))
+    def _is_coordinator(self) -> bool:
+        """Return True if this entity controls the group coordinator."""
+        return self._coordinator_soco().uid == self.soco.uid
 
     # ------------------ HA entity bits -------------------
 
@@ -237,9 +233,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     @soco_error()
     def set_native_value(self, value: float) -> None:
         """Set group volume (0–100). If not grouped, set player volume."""
-        # Clamp and half-up round to match Sonos UI
-        fval = max(0.0, min(100.0, float(value)))
-        level = self._round_half_up(fval)
+        level = int(round(max(0.0, min(100.0, float(value)))))
 
         if self._is_grouped():
             # Set at the coordinator
@@ -262,21 +256,16 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         await self._async_refresh_from_device()
 
     async def _async_refresh_from_device(self) -> None:
-        """Read the authoritative group (or player) volume and propagate to peers."""
-        # We prefer the coordinator's group volume; it's authoritative and updates immediately.
+        """Read the *native* volume (group or player) and propagate to peers."""
+        gid_actual = self.soco.group.uid
+
         def _get() -> int | None:
             try:
-                # 1) Try coordinator.group.volume (works whether we're the coordinator or a member)
-                try:
-                    coord = self._coordinator_soco()
-                    return int(coord.group.volume)
-                except (SoCoException, OSError, AttributeError, ValueError, TypeError):
-                    # 2) Fallback: our own group's volume (still group context if available)
-                    try:
-                        return int(self.soco.group.volume)
-                    except (SoCoException, OSError, AttributeError, ValueError, TypeError):
-                        # 3) Last resort: ungrouped or no group info → mirror player volume
-                        return int(self.soco.volume)
+                if self._is_grouped():
+                    # Any member can query; SoCo will address the coordinator
+                    return int(self.soco.group.volume)
+                # Ungrouped: mirror player volume
+                return int(self.soco.volume)
             except (SoCoException, OSError) as err:
                 _LOGGER.debug(
                     "Failed to read volume for %s: %s", self.speaker.zone_name, err
@@ -291,21 +280,22 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self._value = vol
         self.async_write_ha_state()
 
-        # If we can identify a group id, fan out to peers so they update instantly.
-        gid_actual = getattr(getattr(self.soco, "group", None), "uid", None)
-        if gid_actual:
+        # Fan-out the fresh *group* value so peers update immediately.
+        # Make the coordinator authoritative to avoid stale overwrites.
+        if self._is_grouped() and gid_actual and self._is_coordinator():
             async_dispatcher_send(self.hass, _gv_signal(gid_actual), vol)
             if changed:
                 _LOGGER.debug(
-                    "GV refresh: zone=%s gid=%s vol=%s",
+                    "GV refresh: zone=%s grouped=True gid=%s vol=%s (authoritative)",
                     self.speaker.zone_name,
                     gid_actual,
                     vol,
                 )
         elif changed:
             _LOGGER.debug(
-                "GV refresh: zone=%s (ungrouped) vol=%s",
+                "GV refresh: zone=%s grouped=%s vol=%s",
                 self.speaker.zone_name,
+                bool(gid_actual),
                 vol,
             )
 
@@ -385,11 +375,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
     @callback
     def _on_group_volume_fanned(self, level: int) -> None:
-        """Receive a peer's fresh group volume and update instantly.
-
-        Do not gate on _is_grouped(); subscription is group-scoped and
-        topology can bounce briefly, which would otherwise drop valid updates.
-        """
+        """Receive the coordinator's fresh group volume and update instantly."""
         if self._value != level:
             self._value = level
             self.async_write_ha_state()
