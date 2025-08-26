@@ -385,9 +385,11 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
     @callback
     def _on_group_volume_fanned(self, level: int) -> None:
-        """Receive a peer's fresh group volume and update instantly."""
-        if not self._is_grouped():
-            return
+        """Receive a peer's fresh group volume and update instantly.
+
+        Do not gate on _is_grouped(); subscription is group-scoped and
+        topology can bounce briefly, which would otherwise drop valid updates.
+        """
         if self._value != level:
             self._value = level
             self.async_write_ha_state()
