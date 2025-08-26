@@ -1,5 +1,5 @@
 """Entity representing a Sonos number control."""
-booger
+
 from __future__ import annotations
 
 from collections.abc import Callable
