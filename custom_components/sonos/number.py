@@ -262,34 +262,21 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         await self._async_refresh_from_device()
 
     async def _async_refresh_from_device(self) -> None:
-        """Read the *native* volume (group or player) and propagate to peers."""
-        gid_actual = self.soco.group.uid
-
+        """Read the authoritative group (or player) volume and propagate to peers."""
+        # We prefer the coordinator's group volume; it's authoritative and updates immediately.
         def _get() -> int | None:
             try:
-                if self._is_grouped():
-                    # Prefer the coordinator's native group volume (authoritative & immediate)
+                # 1) Try coordinator.group.volume (works whether we're the coordinator or a member)
+                try:
+                    coord = self._coordinator_soco()
+                    return int(coord.group.volume)
+                except (SoCoException, OSError, AttributeError, ValueError, TypeError):
+                    # 2) Fallback: our own group's volume (still group context if available)
                     try:
-                        coord = self._coordinator_soco()
-                        return int(coord.group.volume)
-                    except (SoCoException, OSError, AttributeError, ValueError, TypeError):
-                        # Fallback: recompute from current member volumes and half-up round
-                        members = getattr(self.soco.group, "members", None) or []
-                        vols: list[int] = []
-                        for m in members:
-                            try:
-                                v = int(getattr(m, "volume"))
-                            except (AttributeError, SoCoException, ValueError, TypeError):
-                                continue
-                            vols.append(v)
-                        if vols:
-                            avg = sum(vols) / len(vols)
-                            return SonosGroupVolumeEntity._round_half_up(avg)
-                        # Last resort: try this player's group property
                         return int(self.soco.group.volume)
-
-                # Ungrouped: mirror player volume
-                return int(self.soco.volume)
+                    except (SoCoException, OSError, AttributeError, ValueError, TypeError):
+                        # 3) Last resort: ungrouped or no group info → mirror player volume
+                        return int(self.soco.volume)
             except (SoCoException, OSError) as err:
                 _LOGGER.debug(
                     "Failed to read volume for %s: %s", self.speaker.zone_name, err
@@ -304,19 +291,20 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self._value = vol
         self.async_write_ha_state()
 
-        # Fan-out the fresh *group* value so peers update immediately
-        if self._is_grouped() and gid_actual:
+        # If we can identify a group id, fan out to peers so they update instantly.
+        gid_actual = getattr(getattr(self.soco, "group", None), "uid", None)
+        if gid_actual:
             async_dispatcher_send(self.hass, _gv_signal(gid_actual), vol)
             if changed:
                 _LOGGER.debug(
-                    "GV refresh: zone=%s grouped=True gid=%s vol=%s",
+                    "GV refresh: zone=%s gid=%s vol=%s",
                     self.speaker.zone_name,
                     gid_actual,
                     vol,
                 )
         elif changed:
             _LOGGER.debug(
-                "GV refresh: zone=%s grouped=False vol=%s",
+                "GV refresh: zone=%s (ungrouped) vol=%s",
                 self.speaker.zone_name,
                 vol,
             )
