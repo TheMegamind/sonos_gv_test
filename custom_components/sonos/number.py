@@ -268,20 +268,26 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         def _get() -> int | None:
             try:
                 if self._is_grouped():
-                    # Recompute from current member volumes to match Sonos UI (avg, halves round up)
-                    members = getattr(self.soco.group, "members", None) or []
-                    vols: list[int] = []
-                    for m in members:
-                        try:
-                            v = int(getattr(m, "volume"))
-                        except (AttributeError, SoCoException, ValueError, TypeError):
-                            continue
-                        vols.append(v)
-                    if vols:
-                        avg = sum(vols) / len(vols)
-                        return SonosGroupVolumeEntity._round_half_up(avg)
-                    # Fallback to the coordinator's group property if members unavailable
-                    return int(self.soco.group.volume)
+                    # Prefer the coordinator's native group volume (authoritative & immediate)
+                    try:
+                        coord = self._coordinator_soco()
+                        return int(coord.group.volume)
+                    except (SoCoException, OSError, AttributeError, ValueError, TypeError):
+                        # Fallback: recompute from current member volumes and half-up round
+                        members = getattr(self.soco.group, "members", None) or []
+                        vols: list[int] = []
+                        for m in members:
+                            try:
+                                v = int(getattr(m, "volume"))
+                            except (AttributeError, SoCoException, ValueError, TypeError):
+                                continue
+                            vols.append(v)
+                        if vols:
+                            avg = sum(vols) / len(vols)
+                            return SonosGroupVolumeEntity._round_half_up(avg)
+                        # Last resort: try this player's group property
+                        return int(self.soco.group.volume)
+
                 # Ungrouped: mirror player volume
                 return int(self.soco.volume)
             except (SoCoException, OSError) as err:
