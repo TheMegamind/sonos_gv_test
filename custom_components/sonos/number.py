@@ -105,7 +105,7 @@ async def async_setup_entry(
         return features
 
     async def _async_create_entities(speaker: SonosSpeaker) -> None:
-        entities: list[NumberEntity] = []
+        entities = []
 
         available_features = await hass.async_add_executor_job(
             available_soco_attributes, speaker
