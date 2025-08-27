@@ -325,7 +325,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     @soco_error()
     def set_native_value(self, value: float) -> None:
         """Set group volume (0–100). If not grouped, set player volume."""
-        level = int(round(max(0.0, min(100.0, float(value)))))
+        level = int(max(0.0, min(100.0, float(value) + 0.5)))
     
         if self._is_grouped():
             # Always set on the coordinator
