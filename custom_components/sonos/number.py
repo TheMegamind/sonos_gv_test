@@ -326,20 +326,24 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def set_native_value(self, value: float) -> None:
         """Set group volume (0–100). If not grouped, set player volume."""
         level = int(round(max(0.0, min(100.0, float(value)))))
-
+    
         if self._is_grouped():
             # Always set on the coordinator
             coord = self._coordinator_soco()
             coord.group.volume = level
             gid = self._current_group_uid()
             if gid:
-                async_dispatcher_send(self.hass, _gv_req_signal(gid), None)
+                # ⬇️ thread-safe signal dispatch from a worker thread
+                self.hass.loop.call_soon_threadsafe(
+                    async_dispatcher_send, self.hass, _gv_req_signal(gid), None
+                )
                 self._schedule_delayed_refresh()
         else:
             # Not grouped → act as player volume mirror
             self.soco.volume = level
             self._value = level
             self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
+
 
     async def _async_fallback_poll(self) -> None:
         await self._async_refresh_from_device()
