@@ -196,7 +196,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self._unsub_coord: Callable[[], None] | None = None
         self._unsub_member: Callable[[], None] | None = None
         self._unsub_activity: Callable[[], None] | None = None
-        self._unsub_stop: Callable[[], None] | None = None
         self._unsub_gv_signal: Callable[[], None] | None = None
         self._unsub_gv_req: Callable[[], None] | None = None
         self._delay_unsub: Callable[[], None] | None = None
@@ -442,16 +441,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         # Coordinator listens for refresh requests for its group (if applicable)
         self._subscribe_group_requests_if_coord(self._group_uid)
 
-        # Cancel nothing on HA stop (defensive placeholder)
-        @callback
-        def _on_stop(_event) -> None:
-            return
-
-        self._unsub_stop = self.hass.bus.async_listen_once(
-            EVENT_HOMEASSISTANT_STOP, _on_stop
-        )
-        self.async_on_remove(self._unsub_stop)
-
         # Initial read + small delayed follow-up to catch startup settling
         await self._async_refresh_from_device()
         self._schedule_delayed_refresh()
@@ -475,9 +464,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         if self._unsub_activity is not None:
             self._unsub_activity()
             self._unsub_activity = None
-        if self._unsub_stop is not None:
-            self._unsub_stop()
-            self._unsub_stop = None
         if self._delay_unsub is not None:
             self._delay_unsub()
             self._delay_unsub = None
