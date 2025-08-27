@@ -200,7 +200,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         self._unsub_gv_req: Callable[[], None] | None = None
         self._delay_unsub: Callable[[], None] | None = None
 
-        # Internal cache of our last value (UI render)
+        # Internal cache of our last value 
         self._value: int | None = None
 
     # ---------------------- helpers ----------------------
