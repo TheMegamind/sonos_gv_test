@@ -426,8 +426,8 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         # Coordinator listens for refresh requests for its group (if applicable)
         self._subscribe_group_requests_if_coord(self._group_uid)
 
-        # Initial read + small delayed follow-up to catch startup settling
-        self._rebind_for_topology_change()
+        # Schedule the initial refresh with a delay to ensure topology is known.
+        self._schedule_delayed_refresh(seconds=2.0)
 
     async def async_will_remove_from_hass(self) -> None:
         """Clean up signal subscriptions on removal."""
