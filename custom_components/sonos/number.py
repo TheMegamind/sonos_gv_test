@@ -316,14 +316,12 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def native_value(self) -> float | None:
         """Return the current group volume (0–100) or None if unknown."""
         return None if self._value is None else float(self._value)
-
-    @soco_error()
+        
     def set_native_value(self, value: float) -> None:
         """Set group volume (0–100). If not grouped, set player volume."""
         level = int(max(0.0, min(100.0, float(value) + 0.5)))
-    
+
         if self._is_grouped():
-            # Always set on the coordinator
             coord = self._coordinator_soco()
             coord.group.volume = level
             group_uid = self._current_group_uid()
@@ -335,6 +333,10 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         else:
             # Not grouped → act as player volume mirror
             self.soco.volume = level
+            # ✅ keep HA state accurate even without a later activity event
+            self._value = level
+            self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
+
 
     async def _async_fallback_poll(self) -> None:
         await self._async_refresh_from_device()
