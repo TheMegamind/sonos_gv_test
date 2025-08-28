@@ -227,13 +227,12 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             self._delay_unsubscribe()
             self._delay_unsubscribe = None
  
-        def _cb(_now) -> None:
+        def _delayed_refresh(_now) -> None:
             self._delay_unsubscribe = None
-            # Re-evaluate coordinator/group and (re)subscribe before refreshing.
             self._rebind_for_topology_change()
             self.hass.add_job(self._async_refresh_from_device)
             
-        self._delay_unsubscribe = async_call_later(self.hass, seconds, _cb)
+        self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
 
     def _subscribe_group_fanout(self, group_uid: str | None) -> None:
         """Subscribe to current group's fan-out signal."""
