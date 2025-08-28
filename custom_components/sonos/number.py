@@ -397,39 +397,49 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 "GV mirror (ungrouped): zone=%s vol=%s", self.speaker.zone_name, vol
             )
 
-    async def async_added_to_hass(self) -> None:
-        """Finish setup: bind signals and perform an initial refresh."""
+        async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
 
         self._coord_uid = (self.speaker.coordinator or self.speaker).uid
         self._group_uid = self._current_group_uid()
 
-        # Any activity from any speaker → rebind & refresh
+        # Rebinders you already had
         self._unsubscribe_activity = async_dispatcher_connect(
             self.hass, SONOS_SPEAKER_ACTIVITY, self._on_any_activity
         )
         self.async_on_remove(self._unsubscribe_activity)
 
-        # Coordinator state updates
         self._unsubscribe_coord = async_dispatcher_connect(
             self.hass, f"{SONOS_STATE_UPDATED}-{self._coord_uid}", self._on_coord_state_updated
         )
         self.async_on_remove(self._unsubscribe_coord)
 
-        # This member's own updates
         self._unsubscribe_member = async_dispatcher_connect(
             self.hass, f"{SONOS_STATE_UPDATED}-{self.speaker.uid}", self._on_member_state_updated
         )
         self.async_on_remove(self._unsubscribe_member)
 
-        # Subscribe to fan-out for our current group (if any)
         self._subscribe_group_fanout(self._group_uid)
-
-        # Coordinator listens for refresh requests for its group (if applicable)
         self._subscribe_group_requests_if_coord(self._group_uid)
 
-        # Initial read + small delayed follow-up to catch startup settling
-        self._rebind_for_topology_change()
+        # NEW: if the speaker isn’t available yet, watch for the first moment it is.
+        if not self.speaker.available:
+            @callback
+            def _on_first_available(*_):
+                if not self.speaker.available:
+                    return
+                # Stop listening and immediately refresh now that we can reach the device
+                if unsub_first_available is not None:
+                    unsub_first_available()
+                self.hass.async_create_task(self._async_refresh_from_device())
+
+            unsub_first_available = async_dispatcher_connect(
+                self.hass, SONOS_SPEAKER_ACTIVITY, _on_first_available
+            )
+            self.async_on_remove(unsub_first_available)
+
+        # Kick one read (safe if already available; harmless if not—will be picked up by the hook)
+        self.hass.async_create_task(self._async_refresh_from_device())
 
     async def async_will_remove_from_hass(self) -> None:
         """Clean up signal subscriptions on removal."""
