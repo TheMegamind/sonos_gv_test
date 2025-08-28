@@ -220,17 +220,18 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
+
     def _schedule_delayed_refresh(self, seconds: float = 0.4) -> None:
-        """Coalesce a short delayed refresh to catch Sonos settling after joins/leaves."""
+        """Coalesce a short delayed **rebind+refresh** to catch startup/join/leave settling."""
         if self._delay_unsubscribe is not None:
             self._delay_unsubscribe()
             self._delay_unsubscribe = None
-
+ 
         def _cb(_now) -> None:
             self._delay_unsubscribe = None
+            # Re-evaluate coordinator/group and (re)subscribe before refreshing.
+            self._rebind_for_topology_change()
             self.hass.add_job(self._async_refresh_from_device)
-
-        self._delay_unsubscribe = async_call_later(self.hass, seconds, _cb)
 
     def _subscribe_group_fanout(self, group_uid: str | None) -> None:
         """Subscribe to current group's fan-out signal."""
@@ -398,8 +399,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     async def async_added_to_hass(self) -> None:
         """Finish setup: bind signals and perform an initial refresh."""
         await super().async_added_to_hass()
-        # Fetch initial value *synchronously* so state isn’t "unknown" at startup.
-        await self._async_refresh_from_device()
 
         self._coord_uid = (self.speaker.coordinator or self.speaker).uid
         self._group_uid = self._current_group_uid()
