@@ -398,6 +398,8 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     async def async_added_to_hass(self) -> None:
         """Finish setup: bind signals and perform an initial refresh."""
         await super().async_added_to_hass()
+        # Ensure we have an initial value so the state isn't "unknown" after a restart.
+        self.hass.async_create_task(self._async_refresh_from_device())
 
         self._coord_uid = (self.speaker.coordinator or self.speaker).uid
         self._group_uid = self._current_group_uid()
