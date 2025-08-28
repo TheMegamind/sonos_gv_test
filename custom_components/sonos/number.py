@@ -220,19 +220,18 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
-    def _schedule_delayed_refresh(self, seconds: float = 0.4) -> None:
-        """Coalesce a short delayed refresh to catch Sonos settling after joins/leaves."""
-        if self._delay_unsubscribe is not None:
-            self._delay_unsubscribe()
-            self._delay_unsubscribe = None
+    def _schedule_delayed_refresh(self, seconds: float = 1.0) -> None:
+    """Coalesce a short delayed rebind+refresh to catch startup/join/leave settling."""
+    if self._delay_unsubscribe is not None:
+        self._delay_unsubscribe()
+        self._delay_unsubscribe = None
 
-        def _delayed_refresh(_now) -> None:
-            self._delay_unsubscribe = None
-            self._rebind_for_topology_change()
-            self.hass.add_job(self._async_refresh_from_device)
+    def _rebind_then_refresh(_now) -> None:
+        self._delay_unsubscribe = None
+        self._rebind_for_topology_change()
+        self.hass.async_create_task(self._async_refresh_from_device())
 
-        self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
-
+    self._delay_unsubscribe = async_call_later(self.hass, seconds, _rebind_then_refresh)
 
     def _subscribe_group_fanout(self, group_uid: str | None) -> None:
         """Subscribe to current group's fan-out signal."""
@@ -289,22 +288,15 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         # Now pick the right immediate next step
         if self._is_grouped():
             if self._is_coordinator():
-                # Authoritative read + fan-out (now and shortly after)
-                self.hass.add_job(self._async_refresh_from_device)
-                self._schedule_delayed_refresh()
+                # Give members time to bind to the suffixed gid signal
+                self._schedule_delayed_refresh(0.8)
             else:
-                group_uid = self._current_group_uid()
-                if group_uid:
-                    async_dispatcher_send(self.hass, _gv_req_signal(group_uid), None)
-                    self._schedule_delayed_refresh()
+                gid = self._current_group_uid()
+                if gid:
+                    async_dispatcher_send(self.hass, _gv_req_signal(gid), None)
+                self._schedule_delayed_refresh(1.0)
         else:
-            # Ungrouped: cancel any group listeners and mirror own value
-            if self._unsubscribe_gv_req is not None:
-                self._unsubscribe_gv_req()
-                self._unsubscribe_gv_req = None
-            if self._unsubscribe_gv_signal is not None:
-                self._unsubscribe_gv_signal()
-                self._unsubscribe_gv_signal = None
+            # Ungrouped: mirror own value, but still use the delayed rebind+refresh
             self.hass.add_job(self._async_refresh_from_device)
             
     @property
@@ -430,6 +422,8 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
         # Initial read + small delayed follow-up to catch startup settling
         self._rebind_for_topology_change()
+        # Optional extra safety net:
+        self._schedule_delayed_refresh(2.0)
 
     async def async_will_remove_from_hass(self) -> None:
         """Clean up signal subscriptions on removal."""
