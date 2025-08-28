@@ -220,7 +220,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
-    def _schedule_delayed_refresh(self, seconds: float = 0.4) -> None:
+    def _schedule_delayed_refresh(self, seconds: float = 2.0) -> None:
         """Coalesce a short delayed refresh to catch Sonos settling after joins/leaves."""
         if self._delay_unsubscribe is not None:
             self._delay_unsubscribe()
