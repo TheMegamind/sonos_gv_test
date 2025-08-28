@@ -220,19 +220,17 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
-
     def _schedule_delayed_refresh(self, seconds: float = 0.4) -> None:
-        """Coalesce a short delayed **rebind+refresh** to catch startup/join/leave settling."""
+        """Coalesce a short delayed refresh to catch Sonos settling after joins/leaves."""
         if self._delay_unsubscribe is not None:
             self._delay_unsubscribe()
             self._delay_unsubscribe = None
- 
-        def _delayed_refresh(_now) -> None:
+
+        def _cb(_now) -> None:
             self._delay_unsubscribe = None
-            self._rebind_for_topology_change()
             self.hass.add_job(self._async_refresh_from_device)
-            
-        self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
+
+        self._delay_unsubscribe = async_call_later(self.hass, seconds, _cb)
 
     def _subscribe_group_fanout(self, group_uid: str | None) -> None:
         """Subscribe to current group's fan-out signal."""
@@ -316,12 +314,14 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def native_value(self) -> float | None:
         """Return the current group volume (0–100) or None if unknown."""
         return None if self._value is None else float(self._value)
-        
+
+    @soco_error()
     def set_native_value(self, value: float) -> None:
         """Set group volume (0–100). If not grouped, set player volume."""
         level = int(max(0.0, min(100.0, float(value) + 0.5)))
-
+    
         if self._is_grouped():
+            # Always set on the coordinator
             coord = self._coordinator_soco()
             coord.group.volume = level
             group_uid = self._current_group_uid()
@@ -333,10 +333,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         else:
             # Not grouped → act as player volume mirror
             self.soco.volume = level
-            # ✅ keep HA state accurate even without a later activity event
-            self._value = level
-            self.hass.loop.call_soon_threadsafe(self.async_write_ha_state)
-
 
     async def _async_fallback_poll(self) -> None:
         await self._async_refresh_from_device()
