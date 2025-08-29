@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import logging
+import time  # ← added
 from typing import cast
 
 from soco.exceptions import SoCoException
@@ -190,6 +191,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         # Internal cache of our last value
         self._value: int | None = None
 
+        # Rebind storm guard
+        self._last_rebind: float = 0.0  # ← added
+
         # DEBUG
         _LOGGER.debug("%s INIT %s", _TAG, _kvs(
             zone=self.speaker.zone_name,
@@ -269,8 +273,28 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             old_coord=(old_c or "")[-6:], old_gid=(old_g or "none")[-6:]
         ))
 
-        # Rebind coord state hook if changed
+        # --- short-circuit/rate-limit (added) ---
+        now = time.monotonic()
+        old_grouped = self._is_grouped()
+        old_coord_flag = self._is_coordinator()
         new_coord_uid = (self.speaker.coordinator or self.speaker).uid
+        new_group_uid = self._current_group_uid()
+        no_change = (
+            new_coord_uid == self._coord_uid and
+            new_group_uid == self._group_uid and
+            old_grouped == self._is_grouped() and
+            old_coord_flag == self._is_coordinator()
+        )
+        if no_change and (now - self._last_rebind) < 1.2:
+            _LOGGER.debug("%s REBIND.skip %s", _TAG, _kvs(
+                zone=self.speaker.zone_name, reason="no_change_rate_limited",
+                coord=old_coord_flag, grouped=old_grouped,
+                coord_uid=(self._coord_uid or '')[-6:], gid=(self._group_uid or 'none')[-6:]
+            ))
+            return
+        # ---------------------------------------
+
+        # Rebind coord state hook if changed
         if new_coord_uid != self._coord_uid:
             self._coord_uid = new_coord_uid
             if self._unsubscribe_coord is not None:
@@ -289,7 +313,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             self.async_on_remove(self._unsubscribe_member)
 
         # Group binding
-        new_group_uid = self._current_group_uid()
         if new_group_uid != self._group_uid:
             self._group_uid = new_group_uid
             self._subscribe_group_fanout(self._group_uid)
@@ -306,12 +329,13 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             coord=self._is_coordinator()
         ))
 
+        self._last_rebind = time.monotonic()  # ← added
+
         # Next step
         if self._is_grouped():
             if self._is_coordinator():
-                # Authoritative read + fan-out (now and shortly after)
-                self.hass.add_job(self._async_refresh_from_device)
-                self._schedule_delayed_refresh()
+                # Authoritative read + fan-out (use single scheduled refresh)  ← changed
+                self._schedule_delayed_refresh(0.5)
             else:
                 group_uid = self._current_group_uid()
                 if group_uid:
@@ -518,8 +542,8 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         _LOGGER.debug("%s REQ.rcv %s", _TAG, _kvs(zone=self.speaker.zone_name, coord=self._is_coordinator()))
         if not (self._is_grouped() and self._is_coordinator()):
             return
-        self.hass.add_job(self._async_refresh_from_device)
-        self._schedule_delayed_refresh()
+        # Only schedule a refresh (avoid immediate + scheduled)  ← changed
+        self._schedule_delayed_refresh(0.5)
 
     @callback
     def _on_coord_state_updated(self, *_: object) -> None:
