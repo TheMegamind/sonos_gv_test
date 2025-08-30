@@ -7,11 +7,11 @@ import logging
 import time
 from typing import cast
 
-from soco.exceptions import SoCoException
 from soco.core import SoCo
+from soco.exceptions import SoCoException
 
 from homeassistant.components.number import NumberEntity, NumberMode
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP, EntityCategory
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
@@ -22,10 +22,10 @@ from homeassistant.helpers.event import async_call_later
 
 from .const import (
     SONOS_CREATE_LEVELS,
-    SONOS_SPEAKER_ACTIVITY,
-    SONOS_STATE_UPDATED,
     SONOS_GROUP_VOLUME_REFRESHED,
     SONOS_GROUP_VOLUME_REQUEST,
+    SONOS_SPEAKER_ACTIVITY,
+    SONOS_STATE_UPDATED,
 )
 from .entity import SonosEntity
 from .helpers import SonosConfigEntry, soco_error
@@ -203,7 +203,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         ):
             return len(members) > 1
         return False
-    
+
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
@@ -244,9 +244,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
     def _rebind_for_topology_change(self) -> None:
         """Re-evaluate coordinator/group, rebind signals, then refresh appropriately."""
-        old_c = self._coord_uid
-        old_g = self._group_uid
-
         # short-circuit/rate-limit
         now = time.monotonic()
         old_grouped = self._is_grouped()
@@ -312,7 +309,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 self._unsubscribe_gv_signal()
                 self._unsubscribe_gv_signal = None
             self.hass.add_job(self._async_refresh_from_device)
-            
+
     @property
     def available(self) -> bool:
         """Return whether the speaker is currently available."""
