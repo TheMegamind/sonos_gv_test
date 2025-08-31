@@ -224,17 +224,34 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
     def _schedule_delayed_refresh(self, seconds: float = 0.4) -> None:
-        """Schedule a short delayed refresh to catch Sonos settling after joins/leaves."""
-        if self._delay_unsubscribe is not None:
-            self._delay_unsubscribe()
-            self._delay_unsubscribe = None
+        """Schedule a short delayed refresh to catch Sonos settling after joins/leaves.
+    
+        Thread-safe: may be invoked from executor threads (e.g. set_native_value path).
+        No-ops if the Home Assistant loop is closed or stopping.
+        """
+        loop = self.hass.loop
+    
+        # If the loop is closed (common during test teardown), don't schedule new work.
+        if loop.is_closed() or not loop.is_running():
+            return
+    
+        def _on_loop() -> None:
+            # Cancel any existing timer
+            if self._delay_unsubscribe is not None:
+                self._delay_unsubscribe()
+                self._delay_unsubscribe = None
+    
+            def _delayed_refresh(_now) -> None:
+                self._delay_unsubscribe = None
+                self._rebind_for_topology_change()
+                # Ensure the refresh is done in the event loop
+                self.hass.async_create_task(self._async_refresh_from_device())
+    
+            self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
+    
+        # Always marshal to the HA loop; safe to call from any thread
+        self.hass.add_job(_on_loop)
 
-        def _delayed_refresh(_now) -> None:
-            self._delay_unsubscribe = None
-            self._rebind_for_topology_change()
-            self.hass.add_job(self._async_refresh_from_device)
-
-        self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
 
     def _subscribe_group_fanout(self, group_uid: str | None) -> None:
         """Subscribe to current group's fan-out signal."""
