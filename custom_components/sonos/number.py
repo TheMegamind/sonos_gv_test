@@ -223,20 +223,15 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
+
     def _schedule_delayed_refresh(self, seconds: float = 0.4) -> None:
         """Schedule a short delayed refresh to catch Sonos settling after joins/leaves.
     
-        Thread-safe: may be invoked from executor threads (e.g. set_native_value path).
-        No-ops if the Home Assistant loop is closed or stopping.
+        Always hop to the HA event loop before touching async_call_later or
+        timer handles, since set_native_value() runs in the executor.
         """
-        loop = self.hass.loop
-    
-        # If the loop is closed (common during test teardown), don't schedule new work.
-        if loop.is_closed() or not loop.is_running():
-            return
-    
-        def _on_loop() -> None:
-            # Cancel any existing timer
+        def _on_loop_schedule() -> None:
+            # Cancel any existing timer on the loop thread
             if self._delay_unsubscribe is not None:
                 self._delay_unsubscribe()
                 self._delay_unsubscribe = None
@@ -244,10 +239,13 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             def _delayed_refresh(_now) -> None:
                 self._delay_unsubscribe = None
                 self._rebind_for_topology_change()
-                # Ensure the refresh is done in the event loop
-                self.hass.async_create_task(self._async_refresh_from_device())
+                self.hass.add_job(self._async_refresh_from_device)
     
             self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
+    
+        # Always schedule the timer creation on the event loop thread
+        self.hass.add_job(_on_loop_schedule)
+
     
         # Always marshal to the HA loop; safe to call from any thread
         self.hass.add_job(_on_loop)
