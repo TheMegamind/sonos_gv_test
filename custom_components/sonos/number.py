@@ -343,19 +343,15 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         level = int(fval + 0.5)
 
         if self._is_grouped():
-            # Always set on the coordinator
             coord = self._coordinator_soco()
             coord.group.volume = level
             group_uid = self._current_group_uid()
             if group_uid:
-                # schedule dispatcher on loop (thread-safe)
-                self.hass.add_job(
-                    async_dispatcher_send, self.hass, _gv_req_signal(group_uid), None
-                )
-                # schedule the delayed refresh on the event loop (thread-safe)
+                # already loop-safe
+                self.hass.add_job(async_dispatcher_send, self.hass, _gv_req_signal(group_uid), None)
+                # make this loop-safe too
                 self.hass.add_job(self._schedule_delayed_refresh)
         else:
-            # Not grouped → act as player volume mirror
             self.soco.volume = level
 
 
