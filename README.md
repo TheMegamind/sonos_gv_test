@@ -1,6 +1,6 @@
 ## Sonos Custom Integration with Group Volume Management 
 
-Please test this per the instructions in the email. If anybody any issues, please let me know ASAP.  
+Please test this per the instructions in the email. If anybody has any issues, please let me know ASAP.  
 
 ### HACS Custom Repository Link
 `https://github.com/TheMegamind/sonos_gv_test.git`
