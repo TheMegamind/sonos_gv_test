@@ -100,7 +100,6 @@ async def async_setup_entry(
 ) -> None:
     """Set up the Sonos number platform from a config entry."""
 
-
     def available_soco_attributes(speaker: SonosSpeaker) -> SocoFeatures:
         features: SocoFeatures = []
         for level_type, valid_range in LEVEL_TYPES.items():
@@ -178,7 +177,8 @@ class SonosLevelEntity(SonosEntity, NumberEntity):
 
 class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     """Group volume (0–100) for the player’s current group.
-    - Grouped: reads/writes GroupRenderingControl group volume.
+
+    - Grouped: uses GroupRenderingControl to read/write group volume.
     - Ungrouped: mirrors the player’s RenderingControl Master volume.
     """
 
@@ -226,7 +226,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
-
     def _schedule_delayed_refresh(self, seconds: float = GV_REFRESH_DELAY) -> None:
         """Schedule a short delayed refresh on the HA loop (thread-safe)."""
 
@@ -258,7 +257,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 # End bootstrap after the first delayed pass
                 self._bootstrap = False
 
-            self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
+            self._delay_unsubscribe = async_call_later(
+                self.hass, seconds, _delayed_refresh
+            )
 
         # If we're already on the loop, call directly; otherwise hop to it safely.
         try:
@@ -274,7 +275,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             # Ensure scheduling runs on the HA loop thread (not an executor)
             self.hass.loop.call_soon_threadsafe(_schedule)
 
-
     async def _async_initial_populate(self) -> None:
         """One-time populate before the coordinator fans out values."""
         if self._is_grouped():
@@ -289,9 +289,10 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                         err,
                     )
                     return None
-                    
+
             vol = await self.hass.async_add_executor_job(_get_group)
         else:
+
             def _get_player() -> int | None:
                 try:
                     return int(self.soco.volume)
@@ -385,7 +386,10 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             elif new_group_uid:
                 # Post request on the HA loop from any thread safely
                 self.hass.loop.call_soon_threadsafe(
-                    async_dispatcher_send, self.hass, _gv_req_signal(new_group_uid), None
+                    async_dispatcher_send,
+                    self.hass,
+                    _gv_req_signal(new_group_uid),
+                    None,
                 )
                 self._schedule_delayed_refresh(GV_REFRESH_DELAY)
         else:
