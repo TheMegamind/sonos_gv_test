@@ -290,7 +290,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                         err,
                     )
                     return None
-
+                    
             vol = await self.hass.async_add_executor_job(_get_group)
         else:
             def _get_player() -> int | None:
