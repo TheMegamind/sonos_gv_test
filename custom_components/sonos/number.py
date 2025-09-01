@@ -191,6 +191,7 @@ class SonosLevelEntity(SonosEntity, NumberEntity):
         """Return the current value."""
         to_number = LEVEL_TO_NUMBER.get(self.level_type, int)
         val = cast(float, to_number(getattr(self.speaker, self.level_type)))
+        _LOGGER.debug("[%s] native_value(%s) -> %s", self.speaker.zone_name, self.level_type, val)
         return val
 
 
