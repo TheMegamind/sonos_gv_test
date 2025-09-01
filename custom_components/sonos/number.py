@@ -211,6 +211,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
+
     def _schedule_delayed_refresh(self, seconds: float = GV_REFRESH_DELAY) -> None:
         """Schedule a short delayed refresh on the HA loop (thread-safe)."""
 
@@ -224,9 +225,10 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             if not loop.is_running() or loop.is_closed():
                 return
 
-            def _delayed_refresh(_now: datetime) -> None:
+            async def _delayed_refresh(_now: datetime) -> None:
                 self._delay_unsubscribe = None
                 self._rebind_for_topology_change()
+
                 # During bootstrap, let members populate from the coordinator once
                 if (
                     self._bootstrap
@@ -234,15 +236,14 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                     and not self._is_coordinator()
                     and self._value is None
                 ):
-                    loop.call_soon(self.hass.async_create_task, self._async_initial_populate())
+                    await self._async_initial_populate()
                 else:
-                    loop.call_soon(self.hass.async_create_task, self._async_refresh_from_device())
+                    await self._async_refresh_from_device()
+
                 # End bootstrap after the first delayed pass
                 self._bootstrap = False
 
-            self._delay_unsubscribe = async_call_later(
-                self.hass, seconds, _delayed_refresh
-            )
+            self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
 
         # If we're already on the loop, call directly; otherwise hop to it safely.
         try:
@@ -257,6 +258,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         else:
             # Ensure scheduling runs on the HA loop thread (not an executor)
             self.hass.loop.call_soon_threadsafe(_schedule)
+
 
     async def _async_initial_populate(self) -> None:
         """One-time best-effort populate that works before coordinator fan-out."""
