@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import asyncio
 import logging
 import time
 from typing import cast
@@ -223,18 +224,46 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
+
     def _schedule_delayed_refresh(self, seconds: float = 0.4) -> None:
-        """Schedule a short delayed refresh to catch Sonos settling after joins/leaves."""
-        if self._delay_unsubscribe is not None:
-            self._delay_unsubscribe()
-            self._delay_unsubscribe = None
+        """Schedule a short delayed refresh from the event-loop thread.
+    
+        Py3.13 debug mode will raise if loop.call_at() is invoked off-thread.
+        Run the scheduling itself in the HA loop thread, and no-op if the loop
+        is shutting down.
+        """
+        def _schedule() -> None:
+            # Cancel any pending timer
+            if self._delay_unsubscribe is not None:
+                self._delay_unsubscribe()
+                self._delay_unsubscribe = None
+    
+            # If the loop is gone (shutdown/teardown), don't schedule anything
+            loop = self.hass.loop
+            if not loop.is_running() or loop.is_closed():
+                return
+    
+            def _delayed_refresh(_now) -> None:
+                self._delay_unsubscribe = None
+                self._rebind_for_topology_change()
+                # Use HA job queue to remain thread-safe
+                self.hass.add_job(self._async_refresh_from_device)
+    
+            self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
+    
+        # If we're already on the HA loop, schedule directly; otherwise hop to it.
+        try:
+            loop = self.hass.loop
+            running = loop.is_running() and asyncio.get_running_loop() is loop
+        except RuntimeError:
+            running = False  # no running loop in this thread
+    
+        if running:
+            _schedule()
+        else:
+            # Make the scheduling itself thread-safe
+            loop.call_soon_threadsafe(lambda: self.hass.add_job(_schedule))
 
-        def _delayed_refresh(_now) -> None:
-            self._delay_unsubscribe = None
-            self._rebind_for_topology_change()
-            self.hass.add_job(self._async_refresh_from_device)
-
-        self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
 
     def _subscribe_group_fanout(self, group_uid: str | None) -> None:
         """Subscribe to current group's fan-out signal."""
@@ -438,6 +467,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
         # Kick an initial rebind/refresh
         self._rebind_for_topology_change()
+        # Ensure an immediate first read so the entity is not unknown at startup
+        await self._async_refresh_from_device()
+
 
     async def async_will_remove_from_hass(self) -> None:
         """Clean up signal subscriptions on removal."""
