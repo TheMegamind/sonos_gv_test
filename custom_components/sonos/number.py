@@ -59,30 +59,13 @@ def _gv_req_signal(group_uid: str) -> str:
 
 
 def _balance_to_number(state: tuple[int, int]) -> float:
-    """Represent a balance measure returned by SoCo as a number.
-
-    SoCo returns a pair of volumes, one for the left side and one
-    for the right side. When the two are equal, sound is centered;
-    HA will show that as 0. When the left side is louder, HA will
-    show a negative value, and a positive value means the right
-    side is louder. Maximum absolute value is 100, which means only
-    one side produces sound at all.
-    """
+    """Represent a balance measure returned by SoCo as a number."""
     left, right = state
     return (right - left) * 100 // max(right, left)
 
 
 def _balance_from_number(value: float) -> tuple[int, int]:
-    """Convert a balance value from -100 to 100 into SoCo format.
-
-    0 becomes (100, 100), fully enabling both sides. Note that
-    the master volume control is separate, so this does not
-    turn up the speakers to maximum volume. Negative values
-    reduce the volume of the right side, and positive values
-    reduce the volume of the left side. -100 becomes (100, 0),
-    fully muting the right side, and +100 becomes (0, 100),
-    muting the left side.
-    """
+    """Convert a balance value from -100 to 100 into SoCo format."""
     left = min(100, 100 - int(value))
     right = min(100, int(value) + 100)
     return left, right
@@ -241,8 +224,8 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             def _delayed_refresh(_now: float) -> None:
                 self._delay_unsubscribe = None
                 self._rebind_for_topology_change()
-                # Kick the actual I/O read as a task on the loop
-                self.hass.async_create_task(self._async_refresh_from_device())
+                # We are on the HA loop here; schedule the coroutine cleanly.
+                loop.call_soon(self.hass.async_create_task, self._async_refresh_from_device())
 
             self._delay_unsubscribe = async_call_later(
                 self.hass, seconds, _delayed_refresh
@@ -338,11 +321,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 # Authoritative read + fan-out (use single scheduled refresh)
                 self._schedule_delayed_refresh(GV_REFRESH_DELAY)
             elif new_group_uid:
-                self.hass.async_add_job(
-                    async_dispatcher_send,
-                    self.hass,
-                    _gv_req_signal(new_group_uid),
-                    None,
+                # Post request on the HA loop from any thread safely
+                self.hass.loop.call_soon_threadsafe(
+                    async_dispatcher_send, self.hass, _gv_req_signal(new_group_uid), None
                 )
                 self._schedule_delayed_refresh()
         else:
@@ -353,7 +334,10 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             if self._unsubscribe_gv_signal is not None:
                 self._unsubscribe_gv_signal()
                 self._unsubscribe_gv_signal = None
-            self.hass.async_create_task(self._async_refresh_from_device())
+            # Ensure we schedule the refresh on the loop safely
+            self.hass.loop.call_soon_threadsafe(
+                self.hass.async_create_task, self._async_refresh_from_device()
+            )
 
     @property
     def available(self) -> bool:
@@ -375,8 +359,8 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             coord.group.volume = level
             new_group_uid = self._current_group_uid()
             if new_group_uid:
-                # schedule dispatcher on loop (thread-safe)
-                self.hass.async_add_job(
+                # Fan-out request safely on the HA loop
+                self.hass.loop.call_soon_threadsafe(
                     async_dispatcher_send,
                     self.hass,
                     _gv_req_signal(new_group_uid),
@@ -416,7 +400,8 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 self._value = vol
                 self.async_write_ha_state()
                 if group_uid_actual:
-                    self.hass.async_add_job(
+                    # Fan-out to members safely (works from any thread)
+                    self.hass.loop.call_soon_threadsafe(
                         async_dispatcher_send,
                         self.hass,
                         _gv_signal(group_uid_actual),
