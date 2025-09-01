@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import asyncio
-from datetime import datetime
 import logging
 import time
 from typing import cast
+
+from datetime import datetime
 
 from soco.core import SoCo
 from soco.exceptions import SoCoException
@@ -211,47 +212,85 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
     def _schedule_delayed_refresh(self, seconds: float = GV_REFRESH_DELAY) -> None:
-        """Schedule a short delayed refresh on the HA loop (thread-safe, type-safe)."""
+        """Schedule a short delayed refresh on the HA loop (thread-safe)."""
 
-        def _post_timer_on_loop() -> None:
-            # Cancel any pending timer (on the loop)
+        def _schedule() -> None:
+            # Cancel any pending timer
             if self._delay_unsubscribe is not None:
                 self._delay_unsubscribe()
                 self._delay_unsubscribe = None
 
-            if self.hass.loop.is_closed() or not self.hass.loop.is_running():
+            loop = self.hass.loop
+            if not loop.is_running() or loop.is_closed():
                 return
 
             def _delayed_refresh(_now: datetime) -> None:
                 self._delay_unsubscribe = None
                 self._rebind_for_topology_change()
+                # During bootstrap, let members populate from the coordinator once
                 if (
                     self._bootstrap
                     and self._is_grouped()
                     and not self._is_coordinator()
                     and self._value is None
                 ):
-                    self.hass.async_create_task(self._async_initial_populate())
+                    loop.call_soon(self.hass.async_create_task, self._async_initial_populate())
                 else:
-                    self.hass.async_create_task(self._async_refresh_from_device())
+                    loop.call_soon(self.hass.async_create_task, self._async_refresh_from_device())
+                # End bootstrap after the first delayed pass
                 self._bootstrap = False
 
-            # Create the timer from the loop thread; store its cancel callable
-            self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
+            self._delay_unsubscribe = async_call_later(
+                self.hass, seconds, _delayed_refresh
+            )
 
+        # If we're already on the loop, call directly; otherwise hop to it safely.
         try:
-            on_loop = (
+            running = (
                 self.hass.loop.is_running()
                 and asyncio.get_running_loop() is self.hass.loop
             )
         except RuntimeError:
-            on_loop = False
-
-        # Always ensure the timer creation happens on the HA loop thread
-        if on_loop:
-            _post_timer_on_loop()
+            running = False
+        if running:
+            _schedule()
         else:
-            self.hass.loop.call_soon_threadsafe(_post_timer_on_loop)
+            # Ensure scheduling runs on the HA loop thread (not an executor)
+            self.hass.loop.call_soon_threadsafe(_schedule)
+
+    async def _async_initial_populate(self) -> None:
+        """One-time best-effort populate that works before coordinator fan-out."""
+        if self._is_grouped():
+            # Read the coordinator's group volume directly
+            def _get_group() -> int | None:
+                try:
+                    return int(self._coordinator_soco().group.volume)
+                except (SoCoException, OSError) as err:
+                    _LOGGER.debug(
+                        "Initial populate: failed group volume for %s: %s",
+                        self.speaker.zone_name,
+                        err,
+                    )
+                    return None
+
+            vol = await self.hass.async_add_executor_job(_get_group)
+        else:
+            def _get_player() -> int | None:
+                try:
+                    return int(self.soco.volume)
+                except (SoCoException, OSError) as err:
+                    _LOGGER.debug(
+                        "Initial populate: failed player volume for %s: %s",
+                        self.speaker.zone_name,
+                        err,
+                    )
+                    return None
+
+            vol = await self.hass.async_add_executor_job(_get_player)
+
+        if vol is not None and self._value != vol:
+            self._value = vol
+            self.async_write_ha_state()
 
     def _subscribe_group_fanout(self, group_uid: str | None) -> None:
         """Subscribe to current group's fan-out signal."""
@@ -340,7 +379,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             if self._unsubscribe_gv_signal is not None:
                 self._unsubscribe_gv_signal()
                 self._unsubscribe_gv_signal = None
-            # Refresh on loop safely
+            # Ensure we schedule the refresh on the loop safely
             self.hass.loop.call_soon_threadsafe(
                 self.hass.async_create_task, self._async_refresh_from_device()
             )
@@ -478,56 +517,9 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         await super().async_will_remove_from_hass()
 
         # Let async_on_remove(...) handle dispatcher unsubs; just cancel timer
-        def _cancel_on_loop() -> None:
-            if self._delay_unsubscribe is not None:
-                self._delay_unsubscribe()
-                self._delay_unsubscribe = None
-
-        try:
-            on_loop = (
-                self.hass.loop.is_running()
-                and asyncio.get_running_loop() is self.hass.loop
-            )
-        except RuntimeError:
-            on_loop = False
-
-        if on_loop:
-            _cancel_on_loop()
-        else:
-            self.hass.loop.call_soon_threadsafe(_cancel_on_loop)
-
-    async def _async_initial_populate(self) -> None:
-        """One-time best-effort populate that works before coordinator fan-out."""
-        if self._is_grouped():
-            def _get_group() -> int | None:
-                try:
-                    return int(self._coordinator_soco().group.volume)
-                except (SoCoException, OSError) as err:
-                    _LOGGER.debug(
-                        "Initial populate: failed group volume for %s: %s",
-                        self.speaker.zone_name,
-                        err,
-                    )
-                    return None
-
-            vol = await self.hass.async_add_executor_job(_get_group)
-        else:
-            def _get_player() -> int | None:
-                try:
-                    return int(self.soco.volume)
-                except (SoCoException, OSError) as err:
-                    _LOGGER.debug(
-                        "Initial populate: failed player volume for %s: %s",
-                        self.speaker.zone_name,
-                        err,
-                    )
-                    return None
-
-            vol = await self.hass.async_add_executor_job(_get_player)
-
-        if vol is not None and self._value != vol:
-            self._value = vol
-            self.async_write_ha_state()
+        if self._delay_unsubscribe is not None:
+            self._delay_unsubscribe()
+            self._delay_unsubscribe = None
 
     @callback
     def _on_group_volume_request(self, *_: object) -> None:
