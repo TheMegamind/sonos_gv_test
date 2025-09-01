@@ -188,6 +188,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
         self._value: int | None = None
         self._last_rebind: float = 0.0
+        self._bootstrap: bool = True  # startup settling window
 
     def _coordinator_soco(self) -> SoCo:
         """Return the coordinator SoCo for this speaker."""
@@ -208,7 +209,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def _is_coordinator(self) -> bool:
         return (self.speaker.coordinator or self.speaker).uid == self.speaker.uid
 
-    def _schedule_delayed_refresh(self, seconds: float = 0.4) -> None:
+    def _schedule_delayed_refresh(self, seconds: float = GV_REFRESH_DELAY) -> None:
         """Schedule a short delayed refresh on the HA loop (thread-safe)."""
 
         def _schedule() -> None:
@@ -224,8 +225,18 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             def _delayed_refresh(_now: float) -> None:
                 self._delay_unsubscribe = None
                 self._rebind_for_topology_change()
-                # We are on the HA loop here; schedule the coroutine cleanly.
-                loop.call_soon(self.hass.async_create_task, self._async_refresh_from_device())
+                # During bootstrap, let members populate from the coordinator once
+                if (
+                    self._bootstrap
+                    and self._is_grouped()
+                    and not self._is_coordinator()
+                    and self._value is None
+                ):
+                    loop.call_soon(self.hass.async_create_task, self._async_initial_populate())
+                else:
+                    loop.call_soon(self.hass.async_create_task, self._async_refresh_from_device())
+                # End bootstrap after the first delayed pass
+                self._bootstrap = False
 
             self._delay_unsubscribe = async_call_later(
                 self.hass, seconds, _delayed_refresh
@@ -244,6 +255,40 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         else:
             # Ensure scheduling runs on the HA loop thread (not an executor)
             self.hass.loop.call_soon_threadsafe(_schedule)
+
+    async def _async_initial_populate(self) -> None:
+        """One-time best-effort populate that works before coordinator fan-out."""
+        if self._is_grouped():
+            # Read the coordinator's group volume directly
+            def _get_group() -> int | None:
+                try:
+                    return int(self._coordinator_soco().group.volume)
+                except (SoCoException, OSError) as err:
+                    _LOGGER.debug(
+                        "Initial populate: failed group volume for %s: %s",
+                        self.speaker.zone_name,
+                        err,
+                    )
+                    return None
+
+            vol = await self.hass.async_add_executor_job(_get_group)
+        else:
+            def _get_player() -> int | None:
+                try:
+                    return int(self.soco.volume)
+                except (SoCoException, OSError) as err:
+                    _LOGGER.debug(
+                        "Initial populate: failed player volume for %s: %s",
+                        self.speaker.zone_name,
+                        err,
+                    )
+                    return None
+
+            vol = await self.hass.async_add_executor_job(_get_player)
+
+        if vol is not None and self._value != vol:
+            self._value = vol
+            self.async_write_ha_state()
 
     def _subscribe_group_fanout(self, group_uid: str | None) -> None:
         """Subscribe to current group's fan-out signal."""
@@ -269,7 +314,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
     def _rebind_for_topology_change(self) -> None:
         """Re-evaluate coordinator/group, rebind signals, then refresh appropriately."""
-        # rate-limit check.
         now = time.monotonic()
         old_grouped = self._is_grouped()
         old_coord_flag = self._is_coordinator()
@@ -318,16 +362,15 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
         if self._is_grouped():
             if self._is_coordinator():
-                # Authoritative read + fan-out (use single scheduled refresh)
                 self._schedule_delayed_refresh(GV_REFRESH_DELAY)
             elif new_group_uid:
                 # Post request on the HA loop from any thread safely
                 self.hass.loop.call_soon_threadsafe(
                     async_dispatcher_send, self.hass, _gv_req_signal(new_group_uid), None
                 )
-                self._schedule_delayed_refresh()
+                self._schedule_delayed_refresh(GV_REFRESH_DELAY)
         else:
-            # Ungrouped: cancel any group listeners and mirror own value
+            # Ungrouped: cancel group listeners and mirror own value
             if self._unsubscribe_gv_req is not None:
                 self._unsubscribe_gv_req()
                 self._unsubscribe_gv_req = None
@@ -366,7 +409,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                     _gv_req_signal(new_group_uid),
                     None,
                 )
-                self._schedule_delayed_refresh()
+                self._schedule_delayed_refresh(GV_REFRESH_DELAY)
         else:
             # Not grouped → act as player volume mirror
             self.soco.volume = level
@@ -462,10 +505,10 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         # Coordinator listens for refresh requests for its group (if applicable)
         self._subscribe_group_requests_if_coord(self._group_uid)
 
-        # Kick an initial rebind/refresh
+        # Kick an initial rebind + populate, then a delayed settle read
         self._rebind_for_topology_change()
-        # Ensure an immediate first read so the entity is not unknown at startup
-        await self._async_refresh_from_device()
+        await self._async_initial_populate()
+        self._schedule_delayed_refresh(GV_REFRESH_DELAY)
 
     async def async_will_remove_from_hass(self) -> None:
         """Clean up signal subscriptions on removal."""
