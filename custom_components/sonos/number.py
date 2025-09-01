@@ -178,7 +178,6 @@ class SonosLevelEntity(SonosEntity, NumberEntity):
 
 class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     """Group volume (0–100) for the player’s current group.
-    
     - Grouped: reads/writes GroupRenderingControl group volume.
     - Ungrouped: mirrors the player’s RenderingControl Master volume.
     """
