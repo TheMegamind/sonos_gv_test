@@ -226,43 +226,34 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
 
 
     def _schedule_delayed_refresh(self, seconds: float = 0.4) -> None:
-        """Schedule a short delayed refresh from the event-loop thread.
-    
-        Py3.13 debug mode will raise if loop.call_at() is invoked off-thread.
-        Run the scheduling itself in the HA loop thread, and no-op if the loop
-        is shutting down.
-        """
+        """Schedule a short delayed refresh on the HA loop (thread-safe)."""
         def _schedule() -> None:
             # Cancel any pending timer
             if self._delay_unsubscribe is not None:
                 self._delay_unsubscribe()
                 self._delay_unsubscribe = None
-    
-            # If the loop is gone (shutdown/teardown), don't schedule anything
+
             loop = self.hass.loop
             if not loop.is_running() or loop.is_closed():
                 return
-    
-            def _delayed_refresh(_now) -> None:
+
+            def _delayed_refresh(_now: float) -> None:
                 self._delay_unsubscribe = None
                 self._rebind_for_topology_change()
-                # Use HA job queue to remain thread-safe
-                self.hass.add_job(self._async_refresh_from_device)
-    
+                # Kick the actual I/O read as a task on the loop
+                self.hass.async_create_task(self._async_refresh_from_device())
+
             self._delay_unsubscribe = async_call_later(self.hass, seconds, _delayed_refresh)
-    
-        # If we're already on the HA loop, schedule directly; otherwise hop to it.
+
+        # If we're already on the loop, call directly; otherwise hop to it safely.
         try:
-            loop = self.hass.loop
-            running = loop.is_running() and asyncio.get_running_loop() is loop
+            running = (self.hass.loop.is_running() and asyncio.get_running_loop() is self.hass.loop)
         except RuntimeError:
-            running = False  # no running loop in this thread
-    
+            running = False
         if running:
             _schedule()
         else:
-            # Make the scheduling itself thread-safe
-            loop.call_soon_threadsafe(lambda: self.hass.add_job(_schedule))
+            self.hass.async_add_job(_schedule)
 
 
     def _subscribe_group_fanout(self, group_uid: str | None) -> None:
@@ -337,7 +328,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 # Authoritative read + fan-out (use single scheduled refresh)
                 self._schedule_delayed_refresh(GV_REFRESH_DELAY)
             elif new_group_uid:
-                self.hass.add_job(
+                self.hass.async_add_job(
                     async_dispatcher_send, self.hass, _gv_req_signal(new_group_uid), None
                 )
                 self._schedule_delayed_refresh()
@@ -350,6 +341,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 self._unsubscribe_gv_signal()
                 self._unsubscribe_gv_signal = None
             self.hass.add_job(self._async_refresh_from_device)
+            self.hass.async_create_task(self._async_refresh_from_device())
 
 
     @property
@@ -368,18 +360,19 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         clamped = max(0.0, min(100.0, float(value)))
         level = int(clamped + 0.5)
         if self._is_grouped():
+        if self._is_grouped():
             coord = self._coordinator_soco()
             coord.group.volume = level
             new_group_uid = self._current_group_uid()
             if new_group_uid:
                 # schedule dispatcher on loop (thread-safe)
-                self.hass.add_job(
-                    async_dispatcher_send, self.hass, _gv_req_signal(new_group_uid), None
-                )
-                self._schedule_delayed_refresh()
-        else:
-            # Not grouped → act as player volume mirror
-            self.soco.volume = level
+                self.hass.async_add_job(
+                     async_dispatcher_send, self.hass, _gv_req_signal(new_group_uid), None
+                 )
+                 self._schedule_delayed_refresh()
+         else:
+             # Not grouped → act as player volume mirror
+             self.soco.volume = level
 
 
     async def _async_fallback_poll(self) -> None:
@@ -411,7 +404,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 self._value = vol
                 self.async_write_ha_state()
                 if group_uid_actual:
-                    self.hass.add_job(
+                    self.hass.async_add_job(
                         async_dispatcher_send, self.hass, _gv_signal(group_uid_actual), (group_uid_actual, vol)
                     )
             return
@@ -475,21 +468,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
         """Clean up signal subscriptions on removal."""
         await super().async_will_remove_from_hass()
 
-        if self._unsubscribe_gv_signal is not None:
-            self._unsubscribe_gv_signal()
-            self._unsubscribe_gv_signal = None
-        if self._unsubscribe_gv_req is not None:
-            self._unsubscribe_gv_req()
-            self._unsubscribe_gv_req = None
-        if self._unsubscribe_coord is not None:
-            self._unsubscribe_coord()
-            self._unsubscribe_coord = None
-        if self._unsubscribe_member is not None:
-            self._unsubscribe_member()
-            self._unsubscribe_member = None
-        if self._unsubscribe_activity is not None:
-            self._unsubscribe_activity()
-            self._unsubscribe_activity = None
+        # Let async_on_remove(...) handle dispatcher unsubs; just cancel timer
         if self._delay_unsubscribe is not None:
             self._delay_unsubscribe()
             self._delay_unsubscribe = None
