@@ -333,73 +333,73 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             self.async_on_remove(self._unsubscribe_gv_req)
 
     def _rebind_for_topology_change(self) -> None:
-        """Re-evaluate coordinator/group, rebind signals, and refresh as needed."""
+        """Re-evaluate coordinator/group, (re)bind signals, and trigger refresh/request."""
         now = time.monotonic()
-        old_group_uid = self._group_uid
-        old_coord_uid = self._coord_uid
-        old_grouped = self._is_grouped()
-        old_coord_flag = self._is_coordinator()
-
+    
+        # Snapshot current topology
+        prev_group_uid = self._group_uid
+        prev_coord_uid = self._coord_uid
+        grouped_before = self._is_grouped()
+        coord_before = self._is_coordinator()
+    
+        # Compute new topology
         new_coord_uid = (self.speaker.coordinator or self.speaker).uid
         new_group_uid = self._current_group_uid()
-
-        # If nothing changed, no need to rebind
-        if (
-            new_coord_uid == old_coord_uid
-            and new_group_uid == old_group_uid
-            and old_grouped == self._is_grouped()
-            and old_coord_flag == self._is_coordinator()
-        ):
-            return
-
-        # Coalesce true topology changes (prevent rapid unsubscribe/resubscribe churn).
-        if (now - self._last_rebind_time) < (GV_REFRESH_DELAY * 2):
-            return
-
-        # Always ensure we listen to our own member state
-        if self._unsubscribe_member is None:
-            self._unsubscribe_member = async_dispatcher_connect(
-                self.hass,
-                f"{SONOS_STATE_UPDATED}-{self.speaker.uid}",
-                self._on_member_state_updated,
-            )
-            self.async_on_remove(self._unsubscribe_member)
-
-        # Group binding
-        if new_group_uid != self._group_uid:
-            self._group_uid = new_group_uid
-            self._subscribe_group_fanout(new_group_uid)
-
-        # (Re)bind coordinator-request listener if we are coordinator
-        self._coord_uid = new_coord_uid
-        self._subscribe_group_requests_if_coord(new_group_uid)
-
-        self._last_rebind_time = time.monotonic()
-
-        if self._is_grouped():
-            if self._is_coordinator():
+        grouped_now = self._is_grouped()
+        coord_now = self._is_coordinator()
+    
+        # Did topology change?
+        topo_changed = (
+            new_coord_uid != prev_coord_uid
+            or new_group_uid != prev_group_uid
+            or grouped_now != grouped_before
+            or coord_now != coord_before
+        )
+    
+        # Only the (un)subscribe/rebind work is throttled/coalesced.
+        if topo_changed and (now - self._last_rebind_time) >= (GV_REFRESH_DELAY * 2):
+            # Always ensure we listen to our own member state
+            if self._unsubscribe_member is None:
+                self._unsubscribe_member = async_dispatcher_connect(
+                    self.hass,
+                    f"{SONOS_STATE_UPDATED}-{self.speaker.uid}",
+                    self._on_member_state_updated,
+                )
+                self.async_on_remove(self._unsubscribe_member)
+    
+            # Rebind group fan-out listener if group changed
+            if new_group_uid != self._group_uid:
+                self._group_uid = new_group_uid
+                self._subscribe_group_fanout(new_group_uid)
+    
+            # Update coordinator and (re)bind coordinator request listener if we are coord
+            self._coord_uid = new_coord_uid
+            self._subscribe_group_requests_if_coord(new_group_uid)
+    
+            self._last_rebind_time = time.monotonic()
+    
+        if grouped_now:
+            if coord_now:
+                # Coordinator: read & fan-out after a short delay
                 self._schedule_delayed_refresh(GV_REFRESH_DELAY)
             elif new_group_uid:
-                # Post request on the HA loop from any thread safely
+                # Member: ask coordinator to refresh and then do our delayed local refresh
                 self.hass.loop.call_soon_threadsafe(
-                    async_dispatcher_send,
-                    self.hass,
-                    _gv_req_signal(new_group_uid),
-                    None,
+                    async_dispatcher_send, self.hass, _gv_req_signal(new_group_uid), None
                 )
                 self._schedule_delayed_refresh(GV_REFRESH_DELAY)
         else:
-            # Ungrouped: drop group listeners and mirror the player’s own volume
+            # Ungrouped: drop group listeners and mirror the player's own volume
             if self._unsubscribe_gv_req is not None:
                 self._unsubscribe_gv_req()
                 self._unsubscribe_gv_req = None
             if self._unsubscribe_gv_signal is not None:
                 self._unsubscribe_gv_signal()
                 self._unsubscribe_gv_signal = None
-            # Schedule refresh on the HA loop safely
             self.hass.loop.call_soon_threadsafe(
                 self.hass.async_create_task, self._async_refresh_from_device()
             )
+     
 
     @property
     def native_value(self) -> float | None:
