@@ -335,19 +335,23 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     def _rebind_for_topology_change(self) -> None:
         """Re-evaluate coordinator/group, rebind signals, and refresh as needed."""
         now = time.monotonic()
+        old_group_uid = self._group_uid
+        old_coord_uid = self._coord_uid
         old_grouped = self._is_grouped()
         old_coord_flag = self._is_coordinator()
+
         new_coord_uid = (self.speaker.coordinator or self.speaker).uid
         new_group_uid = self._current_group_uid()
-        no_change = (
-            new_coord_uid == self._coord_uid
-            and new_group_uid == self._group_uid
+
+        # If nothing changed, no need to rebind
+        if (
+            new_coord_uid == old_coord_uid
+            and new_group_uid == old_group_uid
             and old_grouped == self._is_grouped()
             and old_coord_flag == self._is_coordinator()
-        )
-        # If nothing changed, there's nothing to rebind.
-        if no_change:
+        ):
             return
+
         # Coalesce true topology changes (prevent rapid unsubscribe/resubscribe churn).
         if (now - self._last_rebind_time) < (GV_REFRESH_DELAY * 2):
             return
@@ -367,6 +371,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
             self._subscribe_group_fanout(new_group_uid)
 
         # (Re)bind coordinator-request listener if we are coordinator
+        self._coord_uid = new_coord_uid
         self._subscribe_group_requests_if_coord(new_group_uid)
 
         self._last_rebind_time = time.monotonic()
