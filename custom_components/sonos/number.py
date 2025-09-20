@@ -183,7 +183,6 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     """
 
     _attr_translation_key = "group_volume"
-    _attr_icon = "mdi:volume-high"
     _attr_native_min_value = 0
     _attr_native_max_value = 100
     _attr_native_step = 1
@@ -244,18 +243,7 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
                 self._delay_unsubscribe = None
                 self._rebind_for_topology_change()
 
-                # During bootstrap, let members populate from the coordinator once
-                if (
-                    self._bootstrap
-                    and self._is_grouped()
-                    and not self._is_coordinator()
-                    and self._value is None
-                ):
-                    await self._async_initial_populate()
-                else:
-                    await self._async_refresh_from_device()
-
-                # End bootstrap after the first delayed pass
+                await self._async_refresh_from_device()
                 self._bootstrap = False
 
             self._delay_unsubscribe = async_call_later(
@@ -480,16 +468,16 @@ class SonosGroupVolumeEntity(SonosEntity, NumberEntity):
     async def async_added_to_hass(self) -> None:
         """Bind signals, perform initial populate/refresh, and start subscriptions."""
         await super().async_added_to_hass()
-    
+
         # Listen for any speaker activity
         self._unsubscribe_activity = async_dispatcher_connect(
             self.hass, SONOS_SPEAKER_ACTIVITY, self._on_any_activity
         )
         self.async_on_remove(self._unsubscribe_activity)
-    
+
         # Rebind subscriptions and topology links
         self._rebind_for_topology_change()
-    
+
         # Bootstrap: populate initial value, then schedule a delayed settle refresh
         await self._async_initial_populate()
         self._schedule_delayed_refresh(GV_REFRESH_DELAY)
